@@ -1,0 +1,18 @@
+# Skopiuj do config.toml. ID miasta i usługi znajdziesz przez: luxmed_watch.py discover ...
+interval_minutes = 5   # nie schodź poniżej ~3 min, żeby nie obciążać portalu
+horizon_days = 60
+
+[[watch]]
+label = "Stomatolog"
+city_id = 1
+city_name = "Warszawa"
+service_id = 0          # wstaw ID z `discover services stomat`
+doctors = []            # puste = dowolny lekarz; np. ["Kowalski", "Anna Nowak"]
+clinic_ids = []         # puste = dowolna placówka
+
+[[watch]]
+label = "Dermatolog"
+city_id = 1
+city_name = "Warszawa"
+service_id = 0          # `discover services dermat`
+doctors = ["Nowak"]

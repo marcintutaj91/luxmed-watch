@@ -108,8 +108,10 @@ def flatten(node, acc=None):
 def notify(title, msg):
     print(f"\n*** {title}\n{msg}\n")
     try:  # powiadomienie macOS
-        script = f'display notification {json.dumps(msg)} with title {json.dumps(title)} sound name "Glass"'
-        subprocess.run(["osascript", "-e", script], check=False)
+        subprocess.run(["osascript",
+                        "-e", "on run argv",
+                        "-e", 'display notification (item 1 of argv) with title (item 2 of argv) sound name "Glass"',
+                        "-e", "end run", msg, title], check=False)
     except FileNotFoundError:
         pass
     tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")

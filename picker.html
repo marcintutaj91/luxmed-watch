@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lux Med picker</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 16px; color: #222; background: #fff; }
+  @media (prefers-color-scheme: dark) { body { color: #eee; background: #181818; } textarea, select, input { background: #262626; color: #eee; border-color: #555; } }
+  label { display: block; margin-top: 1rem; font-weight: 600; }
+  select, input, textarea { width: 100%; padding: 8px; font: inherit; box-sizing: border-box; border: 1px solid #bbb; border-radius: 6px; }
+  .docs label { font-weight: 400; margin: .25rem 0; }
+  .docs input { width: auto; margin-right: 8px; }
+  button { margin-top: 1rem; padding: 8px 14px; font: inherit; cursor: pointer; }
+  textarea { height: 11rem; font-family: ui-monospace, monospace; }
+  .hint { color: #888; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>Lux Med picker</h1>
+<p class="hint">Najpierw: <code>python luxmed_watch.py export --city &lt;id&gt; --filter stomat --filter dermat</code>, potem wskaż wygenerowany <code>catalog.json</code>. Wszystko dzieje się lokalnie w przeglądarce.</p>
+
+<label>Plik catalog.json <input type="file" id="file" accept=".json"></label>
+
+<div id="form" hidden>
+  <label>Usługa <select id="service"></select></label>
+  <label>Lekarze <span class="hint">(brak zaznaczenia = dowolny)</span></label>
+  <div class="docs" id="docs"></div>
+  <label>Etykieta <input id="label"></label>
+  <label>Blok do <code>config.toml</code> <textarea id="out" readonly></textarea></label>
+  <button id="copy">Kopiuj</button>
+</div>
+
+<script>
+let cat = null;
+const $ = id => document.getElementById(id);
+
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try { cat = JSON.parse(await f.text()); } catch { alert("To nie jest poprawny JSON."); return; }
+  const sel = $("service");
+  sel.replaceChildren(...cat.services.map(s => new Option(`${s.name} (${s.id})`, s.id)));
+  $("form").hidden = false;
+  renderDoctors();
+});
+
+function renderDoctors() {
+  const list = (cat.doctors[$("service").value] || []);
+  $("docs").replaceChildren(...list.map(d => {
+    const l = document.createElement("label");
+    const c = document.createElement("input");
+    c.type = "checkbox"; c.value = d.name;
+    c.addEventListener("change", render);
+    l.append(c, d.name);
+    return l;
+  }));
+  const s = cat.services.find(x => String(x.id) === $("service").value);
+  $("label").value = s ? s.name : "";
+  render();
+}
+
+function render() {
+  const picked = [...document.querySelectorAll("#docs input:checked")].map(c => c.value);
+  const q = s => JSON.stringify(s);
+  $("out").value = [
+    "[[watch]]",
+    `label = ${q($("label").value)}`,
+    `city_id = ${cat.city.id}`,
+    `city_name = ${q(cat.city.name)}`,
+    `service_id = ${$("service").value}`,
+    `doctors = [${picked.map(q).join(", ")}]`,
+    "clinic_ids = []",
+  ].join("\n");
+}
+
+$("service").addEventListener("change", renderDoctors);
+$("label").addEventListener("input", render);
+$("copy").addEventListener("click", () => navigator.clipboard.writeText($("out").value));
+</script>
+</body>
+</html>

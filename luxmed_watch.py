@@ -158,6 +158,10 @@ def main():
     d.add_argument("filter", nargs="?", default="")
     d.add_argument("--city")
     d.add_argument("--service")
+    e = sub.add_parser("export", help="zapisz katalog usług i lekarzy do catalog.json (dla picker.html)")
+    e.add_argument("--city", required=True, help="ID miasta (z: discover cities)")
+    e.add_argument("--filter", action="append", required=True,
+                   help="fragment nazwy usługi, można podać wielokrotnie, np. --filter stomat --filter dermat")
     w = sub.add_parser("watch")
     w.add_argument("--once", action="store_true")
     a = ap.parse_args()
@@ -183,6 +187,34 @@ def main():
             for x in flatten(data):
                 if a.filter.lower() in str(x["name"]).lower():
                     print(x["id"], x["name"])
+        return
+
+    if a.cmd == "export":
+        city = next((c for c in flatten(client.cities()) if str(c["id"]) == str(a.city)), None)
+        if not city:
+            raise SystemExit(f"Nie znaleziono miasta o ID {a.city}.")
+        wanted = [f.lower() for f in a.filter]
+        services, seen_ids = [], set()
+        for s in flatten(client.services()):
+            if s["id"] not in seen_ids and any(f in str(s["name"]).lower() for f in wanted):
+                seen_ids.add(s["id"])
+                services.append(s)
+        doctors = {}
+        for s in services:
+            time.sleep(random.uniform(1, 2))  # nie obciążaj portalu
+            try:
+                data = client.doctors(a.city, s["id"])
+            except requests.RequestException as ex:
+                print(f"Pomijam usługę {s['id']}: {ex}", file=sys.stderr)
+                continue
+            doctors[str(s["id"])] = [
+                {"id": d.get("id"), "name": f"{d.get('firstName', '')} {d.get('lastName', '')}".strip()}
+                for d in data.get("doctors", [])]
+        out = Path(__file__).with_name("catalog.json")
+        out.write_text(json.dumps({"city": city, "services": services, "doctors": doctors},
+                                  ensure_ascii=False, indent=1))
+        print(f"Zapisano {out.name}: {len(services)} usług, "
+              f"{sum(len(v) for v in doctors.values())} pozycji lekarzy.")
         return
 
     if "watch" not in cfg:

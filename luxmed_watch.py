@@ -29,6 +29,7 @@ import requests
 BASE = "https://portalpacjenta.luxmed.pl/PatientPortal"
 STATE_FILE = Path(__file__).with_name("state.json")
 DEBUG = False
+TG = {}  # {"bot_token": ..., "chat_id": ...}
 
 
 def dbg(*a):
@@ -114,10 +115,38 @@ def notify(title, msg):
                         "-e", "end run", msg, title], check=False)
     except FileNotFoundError:
         pass
-    tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if tok and chat:
-        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                      data={"chat_id": chat, "text": f"{title}\n{msg}"}, timeout=15)
+    if TG.get("bot_token") and TG.get("chat_id"):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TG['bot_token']}/sendMessage",
+                              data={"chat_id": TG["chat_id"], "text": f"{title}\n{msg}"}, timeout=15)
+            if not r.ok:
+                print(f"Telegram: błąd {r.status_code}", file=sys.stderr)
+        except requests.RequestException as e:
+            print("Telegram: brak połączenia:", type(e).__name__, file=sys.stderr)
+
+
+def telegram_setup():
+    """Znajdź chat_id po wiadomości do bota i wyślij wiadomość testowa."""
+    tok = TG.get("bot_token")
+    if not tok:
+        raise SystemExit("Brak bot_token w [telegram] w config.toml.")
+    chat = TG.get("chat_id")
+    if not chat:
+        r = requests.get(f"https://api.telegram.org/bot{tok}/getUpdates", timeout=15)
+        if not r.ok:
+            raise SystemExit(f"Telegram odrzucił token (HTTP {r.status_code}). Sprawdź bot_token.")
+        chats = {u["message"]["chat"]["id"]: u["message"]["chat"].get("first_name", "")
+                 for u in r.json().get("result", []) if "message" in u}
+        if not chats:
+            raise SystemExit("Brak wiadomości do bota. Otwórz bota w Telegramie, wyślij mu /start "
+                             "i uruchom to polecenie ponownie.")
+        for cid, name in chats.items():
+            print(f"chat_id = {cid}   ({name})")
+        chat = next(iter(chats))
+        print("Wpisz chat_id do [telegram] w config.toml. Wysyłam test na pierwszy z nich.")
+    r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                      data={"chat_id": chat, "text": "Lux Med watcher: test powiadomień OK"}, timeout=15)
+    print("Wysłano." if r.ok else f"Błąd wysyłki: HTTP {r.status_code}")
 
 
 def load_state():
@@ -166,6 +195,7 @@ def main():
     e.add_argument("--city", required=True, help="ID miasta (z: discover cities)")
     e.add_argument("--filter", action="append", required=True,
                    help="fragment nazwy usługi, można podać wielokrotnie, np. --filter stomat --filter dermat")
+    sub.add_parser("telegram", help="znajdź chat_id i wyślij wiadomość testową")
     w = sub.add_parser("watch")
     w.add_argument("--once", action="store_true")
     a = ap.parse_args()
@@ -179,6 +209,11 @@ def main():
                          "Wartości tekstowe muszą być w apostrofach lub cudzysłowie, "
                          "np. login = 'abc'.")
     auth = cfg.get("auth", {})
+    TG.update({"bot_token": cfg.get("telegram", {}).get("bot_token") or os.getenv("TELEGRAM_BOT_TOKEN"),
+               "chat_id": cfg.get("telegram", {}).get("chat_id") or os.getenv("TELEGRAM_CHAT_ID")})
+    if a.cmd == "telegram":
+        telegram_setup()
+        return
     login = auth.get("login") or os.getenv("LUXMED_LOGIN")
     pw = auth.get("password") or os.getenv("LUXMED_PASSWORD")
     if not login or not pw:
@@ -230,11 +265,21 @@ def main():
         raise SystemExit("Brak bloków [[watch]] w config.toml.")
     seen = load_state()
     interval = cfg.get("interval_minutes", 5)
+    fails, alerted = 0, False
     while True:
         try:
             check(client, cfg, seen)
-        except requests.RequestException as e:
-            print("Błąd sieci/API:", e, file=sys.stderr)
+            if alerted:
+                notify("Lux Med watcher: działa ponownie", "Nasłuch wrócił do normy.")
+            fails, alerted = 0, False
+        except (requests.RequestException, SystemExit, ValueError, KeyError) as e:
+            fails += 1
+            print("Błąd nasłuchu:", type(e).__name__, e, file=sys.stderr)
+            if fails >= 3 and not alerted:
+                alerted = True
+                notify("Lux Med watcher: PROBLEM",
+                       f"{fails} nieudane sprawdzenia z rzędu ({type(e).__name__}). "
+                       "Nasłuch może nie działać.")
         if a.once:
             break
         time.sleep(interval * 60 * random.uniform(0.8, 1.2))

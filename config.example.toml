@@ -8,6 +8,11 @@ horizon_days = 60
 login = ""
 password = ""
 
+# Opcjonalnie: powiadomienia na telefon. Uzupełnij, potem: python luxmed_watch.py telegram
+[telegram]
+bot_token = ""
+chat_id = ""
+
 [[watch]]
 label = "Stomatolog"
 city_id = 1

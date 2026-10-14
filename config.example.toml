@@ -1,6 +1,12 @@
-# Skopiuj do config.toml. ID miasta i usługi znajdziesz przez: luxmed_watch.py discover ...
+# Skopiuj do config.toml (jest w .gitignore, nie trafi do repo) i ustaw: chmod 600 config.toml
+# ID miasta i usługi znajdziesz przez: luxmed_watch.py discover ...
+
 interval_minutes = 5   # nie schodź poniżej ~3 min, żeby nie obciążać portalu
 horizon_days = 60
+
+[auth]
+login = ""
+password = ""
 
 [[watch]]
 label = "Stomatolog"

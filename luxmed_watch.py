@@ -163,9 +163,14 @@ def main():
     a = ap.parse_args()
     DEBUG = a.debug
 
-    login, pw = os.getenv("LUXMED_LOGIN"), os.getenv("LUXMED_PASSWORD")
+    cfg_path = Path(a.config)
+    cfg = tomllib.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    auth = cfg.get("auth", {})
+    login = auth.get("login") or os.getenv("LUXMED_LOGIN")
+    pw = auth.get("password") or os.getenv("LUXMED_PASSWORD")
     if not login or not pw:
-        raise SystemExit("Ustaw LUXMED_LOGIN i LUXMED_PASSWORD w środowisku (np. z pliku .env).")
+        raise SystemExit("Brak danych logowania: uzupełnij sekcję [auth] w config.toml "
+                         "(albo ustaw LUXMED_LOGIN i LUXMED_PASSWORD).")
     client = Luxmed(login, pw)
 
     if a.cmd == "discover":
@@ -180,7 +185,8 @@ def main():
                     print(x["id"], x["name"])
         return
 
-    cfg = tomllib.loads(Path(a.config).read_text())
+    if "watch" not in cfg:
+        raise SystemExit("Brak bloków [[watch]] w config.toml.")
     seen = load_state()
     interval = cfg.get("interval_minutes", 5)
     while True:

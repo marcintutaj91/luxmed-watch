@@ -61,12 +61,18 @@ class Luxmed:
 
     def get(self, path, **params):
         r = self.s.get(f"{BASE}{path}", params=params, timeout=30)
-        if r.status_code == 401:
+        if r.status_code == 401 or "json" not in r.headers.get("Content-Type", ""):
+            dbg("sesja wygasła lub zła odpowiedź, loguję ponownie", r.status_code)
             self.authenticate()
             r = self.s.get(f"{BASE}{path}", params=params, timeout=30)
         dbg(path, params, r.status_code, r.text[:500])
         r.raise_for_status()
-        return r.json()
+        try:
+            return r.json()
+        except ValueError:
+            kind = r.headers.get("Content-Type", "?")
+            raise RuntimeError(f"Odpowiedź nie jest JSON-em (HTTP {r.status_code}, {kind}): "
+                               f"{r.text[:120]!r}") from None
 
     def cities(self):
         return self.get("/NewPortal/Dictionary/cities")
@@ -272,7 +278,7 @@ def main():
             if alerted:
                 notify("Lux Med watcher: działa ponownie", "Nasłuch wrócił do normy.")
             fails, alerted = 0, False
-        except (requests.RequestException, SystemExit, ValueError, KeyError) as e:
+        except (requests.RequestException, SystemExit, ValueError, KeyError, RuntimeError) as e:
             fails += 1
             print("Błąd nasłuchu:", type(e).__name__, e, file=sys.stderr)
             if fails >= 3 and not alerted:

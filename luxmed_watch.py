@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -38,24 +39,24 @@ def dbg(*a):
 class Luxmed:
     def __init__(self, login, password):
         self.s = requests.Session()
-        dev = str(uuid.uuid4())
-        self.s.headers.update({
-            "User-Agent": f"Patient Portal; 4.19.0; {dev}; Android; 28; {dev}",
-            "Accept": "application/json",
-            "Accept-Language": "pl",
-        })
+        self.s.headers.update({"Accept": "application/json", "Accept-Language": "pl"})
         self.login, self.password = login, password
         self.authenticate()
 
     def authenticate(self):
-        r = self.s.post(f"{BASE}/connect/token", data={
-            "username": self.login, "password": self.password,
-            "grant_type": "password", "client_id": "iPhone",
-        }, timeout=30)
-        dbg("auth", r.status_code, r.text[:300])
-        if r.status_code != 200 or "access_token" not in r.text:
-            raise SystemExit(f"Logowanie nieudane ({r.status_code}). Sprawdź dane lub endpoint (--debug).")
-        self.s.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+        r = self.s.post(f"{BASE}/Account/LogIn", json={"login": self.login, "password": self.password},
+                        timeout=30)
+        body = re.sub(r'("token"\s*:\s*")[^"]+', r'\1<redacted>', r.text)
+        dbg("auth", r.status_code, r.headers.get("Content-Type"), body[:400])
+        try:
+            token = r.json()["token"]
+        except (ValueError, KeyError, TypeError):
+            raise SystemExit(
+                f"Logowanie nieudane (HTTP {r.status_code}). Odpowiedź nie zawiera tokenu: "
+                "błędne dane, wymagane MFA albo zmiana API. Uruchom z --debug.")
+        for k, v in self.s.cookies.items():
+            self.s.headers[k] = v
+        self.s.headers["authorization-token"] = f"Bearer {token}"
 
     def get(self, path, **params):
         r = self.s.get(f"{BASE}{path}", params=params, timeout=30)
@@ -79,10 +80,11 @@ class Luxmed:
     def terms(self, city_id, city_name, service_id, date_from, date_to):
         data = self.get(
             "/NewPortal/terms/index",
-            **{"searchPlace.id": city_id, "searchPlace.name": city_name,
+            **{"searchPlace.id": city_id, "searchPlace.type": 0,
                "serviceVariantId": service_id, "languageId": 10,
                "searchDateFrom": date_from, "searchDateTo": date_to,
-               "delocalized": "false"})
+               "searchDatePreset": (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days,
+               "delocalized": "false", "processId": str(uuid.uuid4())})
         out = []
         for day in (data.get("termsForService") or {}).get("termsForDays") or []:
             out.extend(day.get("terms") or [])
@@ -136,7 +138,7 @@ def check(client, cfg, seen):
             name = f"{doc.get('firstName', '')} {doc.get('lastName', '')}".strip()
             if doctors and not any(x in name.lower() for x in doctors):
                 continue
-            if clinics and str(t.get("clinicId")) not in clinics:
+            if clinics and str(t.get("clinicGroupId", t.get("clinicId"))) not in clinics:
                 continue
             key = f"{w['service_id']}|{t.get('dateTimeFrom')}|{doc.get('id')}|{t.get('clinicId')}"
             if key in seen:

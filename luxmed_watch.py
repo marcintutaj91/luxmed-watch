@@ -168,7 +168,12 @@ def main():
     DEBUG = a.debug
 
     cfg_path = Path(a.config)
-    cfg = tomllib.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    try:
+        cfg = tomllib.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    except tomllib.TOMLDecodeError as ex:
+        raise SystemExit(f"Błąd w {cfg_path.name}: {ex}\n"
+                         "Wartości tekstowe muszą być w apostrofach lub cudzysłowie, "
+                         "np. login = 'abc'.")
     auth = cfg.get("auth", {})
     login = auth.get("login") or os.getenv("LUXMED_LOGIN")
     pw = auth.get("password") or os.getenv("LUXMED_PASSWORD")

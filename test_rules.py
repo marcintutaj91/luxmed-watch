@@ -123,6 +123,19 @@ class CheckTests(unittest.TestCase):
         self.assertNotIn("09:00", n.call_args.args[1])
         self.assertEqual(len(seen), 1)
 
+    def test_term_matching_two_blocks_is_reported_once_by_the_first(self):
+        terms = [term("2026-10-26T14:40:00", doc_id=2, first="ADRIAN", last="SZYMAŃSKI"),
+                 term("2026-10-27T14:40:00", doc_id=3, first="ANNA", last="NOWAK")]
+        specific = {"label": "Szymański", "city_id": 1, "service_id": 6621, "doctors": ["SZYMAŃSKI"]}
+        general = {"label": "Dowolny", "city_id": 1, "service_id": 6621}
+        cfg = {"booking": {"enabled": True}, "watch": [specific, general]}
+        n, seen = self.run_check(cfg, terms)
+        self.assertEqual(n.call_count, 2)
+        by_label = {c.args[0]: c.args[1] for c in n.call_args_list}
+        self.assertIn("Szymański", by_label["Lux Med: Szymański"])
+        self.assertNotIn("Szymański", by_label["Lux Med: Dowolny"])
+        self.assertIn("Anna Nowak", by_label["Lux Med: Dowolny"])
+
     def test_nothing_new_means_no_message(self):
         n, _ = self.run_check(self.cfg(days=["sob"]), [term("2026-10-26T09:00:00")])  # poniedziałek
         n.assert_not_called()

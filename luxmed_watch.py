@@ -328,8 +328,10 @@ MAX_PER_MESSAGE = 10  # reszta trafi do kolejnej wiadomości w następnej rundzi
 def check(client, cfg, seen):
     can_book = bool(cfg.get("booking", {}).get("enabled")) and bool(TG.get("bot_token") and TG.get("chat_id"))
     groups = {}  # (blok, lekarz) -> [(termin, klucz)]
+    claimed = set()  # ten sam termin może pasować do kilku bloków: wygrywa pierwszy z configu
     for w, t, name, key in find_terms(client, cfg):
-        if key not in seen:
+        if key not in seen and key not in claimed:
+            claimed.add(key)
             groups.setdefault((id(w), w.get("label", w["service_id"]), name), []).append((t, key))
     for (_, label, name), items in groups.items():
         items.sort(key=lambda x: x[0]["dateTimeFrom"])

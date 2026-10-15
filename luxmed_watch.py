@@ -305,6 +305,8 @@ def find_terms(client, cfg):
     d_from = date.today().isoformat()
     d_to = (date.today() + timedelta(days=horizon)).isoformat()
     for w in cfg["watch"]:
+        if not w.get("enabled", True):
+            continue  # enabled = false wyłącza blok bez usuwania go z configu
         doctors = [d.lower() for d in w.get("doctors", [])]
         clinics = {str(c) for c in w.get("clinic_ids", [])}
         flt = rules.parse_filter(w)

@@ -18,6 +18,7 @@ chat_id = ""
 [booking]
 enabled = false
 
+# W każdym bloku [[watch]] można dodać: enabled = false (wyłącza blok bez kasowania), true (włącza).
 [[watch]]
 label = "Stomatolog"
 city_id = 1

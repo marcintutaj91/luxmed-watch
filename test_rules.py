@@ -136,6 +136,18 @@ class CheckTests(unittest.TestCase):
         self.assertNotIn("Szymański", by_label["Lux Med: Dowolny"])
         self.assertIn("Anna Nowak", by_label["Lux Med: Dowolny"])
 
+    def test_disabled_block_is_skipped_and_enabled_by_default(self):
+        terms = [term("2026-10-26T14:40:00")]
+        n, seen = self.run_check(self.cfg(enabled=False), terms)
+        n.assert_not_called()
+        self.assertEqual(seen, set())
+        n, _ = self.run_check(self.cfg(enabled=True), terms)
+        self.assertEqual(n.call_count, 1)
+
+    def test_enabled_must_be_a_boolean(self):
+        with self.assertRaisesRegex(rules.ConfigError, "true albo false"):
+            rules.parse_filter({"label": "Derm", "enabled": "false"})
+
     def test_nothing_new_means_no_message(self):
         n, _ = self.run_check(self.cfg(days=["sob"]), [term("2026-10-26T09:00:00")])  # poniedziałek
         n.assert_not_called()

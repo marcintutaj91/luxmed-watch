@@ -39,6 +39,8 @@ def _parse_days(values, label):
 def parse_filter(w):
     """Z bloku [[watch]] robi filtr: hours_from / hours_to ('GG:MM', włącznie) i days (lista dni)."""
     label = w.get("label", w.get("service_id", "watch"))
+    if not isinstance(w.get("enabled", True), bool):
+        raise ConfigError(f"[{label}] enabled = {w['enabled']!r}: użyj true albo false (bez cudzysłowu)")
     return {
         "from": _parse_time(w["hours_from"], "hours_from", label) if "hours_from" in w else None,
         "to": _parse_time(w["hours_to"], "hours_to", label) if "hours_to" in w else None,

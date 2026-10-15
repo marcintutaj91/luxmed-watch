@@ -32,3 +32,7 @@ city_id = 1
 city_name = "Warszawa"
 service_id = 0          # `discover services dermat`
 doctors = ["Nowak"]
+# Opcjonalne filtry (wszystkie włącznie): godzina rozpoczęcia i dni tygodnia
+# hours_from = "16:00"
+# hours_to = "21:00"
+# days = ["pon", "wt", "śr", "czw", "pt"]   # pon, wt, śr, czw, pt, sob, ndz

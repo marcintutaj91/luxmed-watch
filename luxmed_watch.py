@@ -29,6 +29,8 @@ from pathlib import Path
 import requests
 
 import booking
+import rules
+from rules import DNI
 
 BASE = "https://portalpacjenta.luxmed.pl/PatientPortal"
 STATE_FILE = Path(__file__).with_name("state.json")
@@ -143,7 +145,8 @@ def flatten(node, acc=None):
     return acc
 
 
-def notify(title, msg, book_id=None):
+def notify(title, msg, buttons=None):
+    """buttons: lista (tekst, book_id); każdy przycisk w osobnym wierszu."""
     print(f"\n*** {title}\n{msg}\n")
     try:  # powiadomienie macOS
         subprocess.run(["osascript",
@@ -154,9 +157,9 @@ def notify(title, msg, book_id=None):
         pass
     if TG.get("bot_token") and TG.get("chat_id"):
         data = {"chat_id": TG["chat_id"], "text": f"{title}\n{msg}"}
-        if book_id:
-            data["reply_markup"] = json.dumps({"inline_keyboard": [[
-                {"text": "Zarezerwuj", "callback_data": f"book:{book_id}"}]]})
+        if buttons:
+            data["reply_markup"] = json.dumps({"inline_keyboard": [
+                [{"text": text, "callback_data": f"book:{bid}"}] for text, bid in buttons]})
         tg_api("sendMessage", **data)
 
 
@@ -277,9 +280,6 @@ def load_state():
         return set()
 
 
-DNI = ["pon", "wt", "śr", "czw", "pt", "sob", "ndz"]
-
-
 def format_term(t, name):
     """Czytelny opis terminu: 'czw 15.10, 17:20 (40 min) · jutro'."""
     start = datetime.fromisoformat(t["dateTimeFrom"])
@@ -307,6 +307,7 @@ def find_terms(client, cfg):
     for w in cfg["watch"]:
         doctors = [d.lower() for d in w.get("doctors", [])]
         clinics = {str(c) for c in w.get("clinic_ids", [])}
+        flt = rules.parse_filter(w)
         terms = client.terms(w["city_id"], w.get("city_name", ""), w["service_id"], d_from, d_to)
         for t in terms:
             doc = t.get("doctor") or {}
@@ -315,19 +316,30 @@ def find_terms(client, cfg):
                 continue
             if clinics and str(t.get("clinicGroupId", t.get("clinicId"))) not in clinics:
                 continue
+            if not rules.allowed(flt, datetime.fromisoformat(t["dateTimeFrom"])):
+                continue
             key = f"{w['service_id']}|{t.get('dateTimeFrom')}|{doc.get('id')}|{t.get('clinicId')}"
             yield w, t, name, key
 
 
+MAX_PER_MESSAGE = 10  # reszta trafi do kolejnej wiadomości w następnej rundzie
+
+
 def check(client, cfg, seen):
     can_book = bool(cfg.get("booking", {}).get("enabled")) and bool(TG.get("bot_token") and TG.get("chat_id"))
+    groups = {}  # (blok, lekarz) -> [(termin, klucz)]
     for w, t, name, key in find_terms(client, cfg):
-        if key in seen:
-            continue
-        seen.add(key)
-        label = w.get("label", w["service_id"])
-        book_id = add_pending(key, t, name, label) if can_book else None
-        notify(f"Lux Med: {label}", format_term(t, name), book_id)
+        if key not in seen:
+            groups.setdefault((id(w), w.get("label", w["service_id"]), name), []).append((t, key))
+    for (_, label, name), items in groups.items():
+        items.sort(key=lambda x: x[0]["dateTimeFrom"])
+        items = items[:MAX_PER_MESSAGE]
+        body, labels = rules.format_group(name, [t for t, _ in items])
+        buttons = [(text, add_pending(key, t, name, label))
+                   for text, (t, key) in zip(labels, items)] if can_book else None
+        for _, key in items:
+            seen.add(key)
+        notify(f"Lux Med: {label}", body, buttons)
     STATE_FILE.write_text(json.dumps(sorted(seen)))
 
 
@@ -415,6 +427,12 @@ def main():
 
     if "watch" not in cfg:
         raise SystemExit("Brak bloków [[watch]] w config.toml.")
+
+    try:
+        for w_ in cfg["watch"]:
+            rules.parse_filter(w_)
+    except rules.ConfigError as ex:
+        raise SystemExit(f"Błąd w config.toml: {ex}")
 
     if a.cmd == "book-test":
         for w, t, name, key in find_terms(client, cfg):

@@ -67,9 +67,11 @@ class Luxmed:
             self.s.headers[k] = v
         self.s.headers["authorization-token"] = f"Bearer {token}"
 
-    def _json(self, r):
+    def _json(self, r, allow_empty=False):
         dbg(r.request.method, r.url.split("PatientPortal")[-1], r.status_code, r.text[:500])
         r.raise_for_status()
+        if allow_empty and not r.text.strip():
+            return {}  # np. releaseterm: HTTP 200 bez treści oznacza sukces
         try:
             return r.json()
         except ValueError:
@@ -95,7 +97,7 @@ class Luxmed:
                     "xsrf-token": token, "x-requested-with": "XMLHttpRequest",
                     "Content-Type": "application/json"})
                 if r.status_code != 401 or attempt == 2:
-                    return self._json(r)
+                    return self._json(r, allow_empty=True)
                 self.authenticate()
 
     def cities(self):

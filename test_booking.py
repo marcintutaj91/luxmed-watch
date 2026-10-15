@@ -104,6 +104,29 @@ class BookTests(unittest.TestCase):
         self.assertEqual(c.steps, ["lockterm", "confirm", "releaseterm"])
 
 
+class ClientPostTests(unittest.TestCase):
+    def _client(self, text, status=200):
+        c = lw.Luxmed.__new__(lw.Luxmed)
+        c.lock = threading.RLock()
+        resp = mock.Mock(status_code=status, text=text, headers={"Content-Type": "application/json"})
+        resp.request.method, resp.url = "POST", "x/PatientPortal/y"
+        resp.json.side_effect = lambda: json.loads(text)
+        resp.raise_for_status = lambda: None
+        c.get = lambda *a, **k: {"token": "t"}
+        c.s = mock.Mock(post=mock.Mock(return_value=resp))
+        return c
+
+    def test_empty_200_body_is_success_for_post(self):
+        self.assertEqual(self._client("").post("/p", {}), {})
+
+    def test_json_body_still_parsed(self):
+        self.assertEqual(self._client('{"a": 1}').post("/p", {}), {"a": 1})
+
+    def test_garbage_body_still_raises(self):
+        with self.assertRaises(RuntimeError):
+            self._client("<html>").post("/p", {})
+
+
 class CallbackTests(unittest.TestCase):
     def setUp(self):
         lw.TG.update({"bot_token": "T", "chat_id": "42"})

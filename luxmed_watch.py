@@ -21,7 +21,7 @@ import sys
 import time
 import tomllib
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -162,6 +162,28 @@ def load_state():
         return set()
 
 
+DNI = ["pon", "wt", "śr", "czw", "pt", "sob", "ndz"]
+
+
+def format_term(t, name):
+    """Czytelny opis terminu: 'czw 15.10, 17:20 (40 min) · jutro'."""
+    start = datetime.fromisoformat(t["dateTimeFrom"])
+    when = f"{DNI[start.weekday()]} {start:%d.%m.%Y}, {start:%H:%M}"
+    try:
+        mins = int((datetime.fromisoformat(t["dateTimeTo"]) - start).total_seconds() // 60)
+        when += f" ({mins} min)"
+    except (KeyError, ValueError):
+        pass
+    days = (start.date() - date.today()).days
+    rel = {0: "DZIŚ", 1: "jutro"}.get(days, f"za {days} dni" if days > 1 else "")
+    if rel:
+        when += f" · {rel}"
+    lines = [when, name.title(), t.get("clinic", "")]
+    if t.get("isTelemedicine"):
+        lines.append("TELEPORADA")
+    return "\n".join(x for x in lines if x)
+
+
 def check(client, cfg, seen):
     horizon = cfg.get("horizon_days", 60)
     d_from = date.today().isoformat()
@@ -181,8 +203,7 @@ def check(client, cfg, seen):
             if key in seen:
                 continue
             seen.add(key)
-            notify(f"Lux Med: {w.get('label', w['service_id'])}",
-                   f"{t.get('dateTimeFrom')}  {name}\n{t.get('clinic', '')}")
+            notify(f"Lux Med: {w.get('label', w['service_id'])}", format_term(t, name))
     STATE_FILE.write_text(json.dumps(sorted(seen)))
 
 

@@ -41,6 +41,8 @@ case "${1:-}" in
   install)
     [ -x "$DIR/.venv/bin/python" ] || { echo "Brak .venv w $DIR"; exit 1; }
     [ -f "$DIR/config.toml" ] || { echo "Brak config.toml w $DIR"; exit 1; }
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    sleep 1
     if pgrep -f "luxmed_watch.py watch" >/dev/null; then
       echo "Działa już inny nasłuch (np. w terminalu). Zatrzymaj go (Ctrl+C) i uruchom ponownie."
       exit 1
@@ -48,7 +50,6 @@ case "${1:-}" in
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
     write_plist "$PLIST"
     plutil -lint "$PLIST" >/dev/null
-    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
     launchctl bootstrap "$DOMAIN" "$PLIST"
     echo "Zainstalowano i uruchomiono. Logi: $LOG"
     ;;

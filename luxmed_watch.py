@@ -29,6 +29,7 @@ from pathlib import Path
 import requests
 
 import booking
+import control
 import rules
 from rules import DNI
 
@@ -37,6 +38,9 @@ STATE_FILE = Path(__file__).with_name("state.json")
 PENDING_FILE = Path(__file__).with_name("pending.json")
 PENDING_LOCK = threading.Lock()
 PENDING_TTL = 24 * 3600
+STATUS = {"last_ok": None, "fails": 0, "last_error": None}
+WAKE = threading.Event()  # przerywa oczekiwanie między sprawdzeniami (np. po /wlacz)
+COMMAND_MAX_AGE = 120  # ignoruj komendy starsze niż tyle sekund (np. zaległe po restarcie)
 DEBUG = False
 TG = {}  # {"bot_token": ..., "chat_id": ...}
 
@@ -231,11 +235,13 @@ def handle_callback(client, cb):
         tg_api("sendMessage", chat_id=TG["chat_id"], text=result)
 
 
-def telegram_listener(client):
+def telegram_listener(client, cfg):
+    tg_api("setMyCommands", commands=json.dumps(
+        [{"command": c, "description": d} for c, d in control.COMMANDS], ensure_ascii=False))
     offset = None
     while True:
         try:
-            params = {"timeout": 25, "allowed_updates": json.dumps(["callback_query"])}
+            params = {"timeout": 25, "allowed_updates": json.dumps(["callback_query", "message"])}
             if offset:
                 params["offset"] = offset
             r = requests.get(f"https://api.telegram.org/bot{TG['bot_token']}/getUpdates",
@@ -244,6 +250,8 @@ def telegram_listener(client):
                 offset = u["update_id"] + 1
                 if u.get("callback_query"):
                     handle_callback(client, u["callback_query"])
+                elif u.get("message"):
+                    handle_message(client, cfg, u["message"])
         except Exception as e:  # wątek nie może paść
             print("Telegram listener:", type(e).__name__, file=sys.stderr)
             time.sleep(10)
@@ -305,8 +313,8 @@ def find_terms(client, cfg):
     d_from = date.today().isoformat()
     d_to = (date.today() + timedelta(days=horizon)).isoformat()
     for w in cfg["watch"]:
-        if not w.get("enabled", True):
-            continue  # enabled = false wyłącza blok bez usuwania go z configu
+        if not control.block_enabled(w):
+            continue  # enabled = false w configu albo /wylacz z Telegrama
         doctors = [d.lower() for d in w.get("doctors", [])]
         clinics = {str(c) for c in w.get("clinic_ids", [])}
         flt = rules.parse_filter(w)
@@ -327,24 +335,119 @@ def find_terms(client, cfg):
 MAX_PER_MESSAGE = 10  # reszta trafi do kolejnej wiadomości w następnej rundzie
 
 
-def check(client, cfg, seen):
-    can_book = bool(cfg.get("booking", {}).get("enabled")) and bool(TG.get("bot_token") and TG.get("chat_id"))
+def can_book_now(cfg):
+    return bool(cfg.get("booking", {}).get("enabled")) and bool(TG.get("bot_token") and TG.get("chat_id"))
+
+
+def collect_groups(client, cfg, seen):
     groups = {}  # (blok, lekarz) -> [(termin, klucz)]
     claimed = set()  # ten sam termin może pasować do kilku bloków: wygrywa pierwszy z configu
     for w, t, name, key in find_terms(client, cfg):
         if key not in seen and key not in claimed:
             claimed.add(key)
             groups.setdefault((id(w), w.get("label", w["service_id"]), name), []).append((t, key))
-    for (_, label, name), items in groups.items():
+    return groups
+
+
+def send_groups(groups, can_book, seen=None, limit=None):
+    for n, ((_, label, name), items) in enumerate(groups.items()):
+        if limit is not None and n >= limit:
+            break
         items.sort(key=lambda x: x[0]["dateTimeFrom"])
         items = items[:MAX_PER_MESSAGE]
         body, labels = rules.format_group(name, [t for t, _ in items])
         buttons = [(text, add_pending(key, t, name, label))
                    for text, (t, key) in zip(labels, items)] if can_book else None
-        for _, key in items:
-            seen.add(key)
+        if seen is not None:
+            seen.update(key for _, key in items)
         notify(f"Lux Med: {label}", body, buttons)
+
+
+def check(client, cfg, seen):
+    if control.is_paused():
+        return
+    send_groups(collect_groups(client, cfg, seen), can_book_now(cfg), seen)
     STATE_FILE.write_text(json.dumps(sorted(seen)))
+
+
+def reply(text):
+    tg_api("sendMessage", chat_id=TG["chat_id"], text=text)
+
+
+def status_text(cfg):
+    lines = ["Nasłuch działa."]
+    if STATUS["last_ok"]:
+        ago = int((time.time() - STATUS["last_ok"]) // 60)
+        lines.append(f"Ostatnie udane sprawdzenie: {datetime.fromtimestamp(STATUS['last_ok']):%H:%M:%S} ({ago} min temu)")
+    else:
+        lines.append("Od startu nie było jeszcze udanego sprawdzenia.")
+    if STATUS["fails"]:
+        lines.append(f"Nieudane sprawdzenia z rzędu: {STATUS['fails']} ({STATUS['last_error']})")
+    lines.append("Powiadomienia: WSTRZYMANE (/wznow)" if control.is_paused() else "Powiadomienia: włączone")
+    lines.append("Rezerwacja przyciskiem: " + ("włączona" if can_book_now(cfg) else "wyłączona"))
+    lines.append(f"Sprawdzam co ok. {cfg.get('interval_minutes', 5)} min\n")
+    lines.append(control.describe_blocks(cfg))
+    return "\n".join(lines)
+
+
+def toggle_block(cfg, arg, value):
+    if not arg:
+        return "Podaj nazwę bloku, np. /wlacz derm\n\n" + control.describe_blocks(cfg)
+    found = control.find_blocks(cfg, arg)
+    if not found:
+        return f"Nie znalazłem bloku pasującego do „{arg}”.\n\n" + control.describe_blocks(cfg)
+    if len(found) > 1:
+        names = "\n".join("• " + control.label_of(w) for w in found)
+        return f"„{arg}” pasuje do kilku bloków, doprecyzuj:\n{names}"
+    control.set_block(found[0], value)
+    WAKE.set()  # sprawdź od razu, nie czekaj na koniec interwału
+    state = "WŁĄCZONY (sprawdzę terminy od razu)" if value else "wyłączony"
+    return f"{control.label_of(found[0])}: {state}"
+
+
+def handle_message(client, cfg, msg):
+    """Komendy z Telegrama; tylko od właściciela bota."""
+    if str(msg.get("from", {}).get("id")) != str(TG.get("chat_id")):
+        return
+    if time.time() - msg.get("date", 0) > COMMAND_MAX_AGE:
+        return
+    parsed = control.parse_command(msg.get("text"))
+    if not parsed:
+        return
+    cmd, arg = parsed
+    if cmd in ("start", "pomoc", "help"):
+        reply(control.HELP)
+    elif cmd == "status":
+        reply(status_text(cfg))
+    elif cmd == "bloki":
+        reply(control.describe_blocks(cfg))
+    elif cmd in ("wlacz", "wylacz"):
+        reply(toggle_block(cfg, arg, cmd == "wlacz"))
+    elif cmd == "pauza":
+        control.set_paused(True)
+        reply("Powiadomienia wstrzymane. Wznowisz komendą /wznow. /terminy nadal działa.")
+    elif cmd == "wznow":
+        control.set_paused(False)
+        WAKE.set()
+        reply("Powiadomienia wznowione, sprawdzam terminy.")
+    elif cmd == "reset":
+        control.reset()
+        WAKE.set()
+        reply("Przywrócono ustawienia z config.toml (koniec pauzy i ręcznych przełączeń).")
+    elif cmd == "terminy":
+        try:
+            groups = collect_groups(client, cfg, set())
+        except (requests.RequestException, RuntimeError, KeyError, ValueError) as e:
+            reply(f"Nie udało się pobrać terminów ({type(e).__name__}).")
+            return
+        if not groups:
+            reply("Brak wolnych terminów dla włączonych bloków.")
+            return
+        send_groups(groups, can_book_now(cfg), None, limit=6)
+        if len(groups) > 6:
+            reply(f"…i {len(groups) - 6} kolejnych lekarzy. Zawęź listę blokami (/bloki).")
+    else:
+        reply("Nieznana komenda. /pomoc pokaże listę.")
 
 
 def main():
@@ -449,19 +552,23 @@ def main():
         raise SystemExit("Brak wolnych terminów pasujących do configu: nie ma na czym testować.")
 
     if cfg.get("booking", {}).get("enabled") and TG.get("bot_token") and TG.get("chat_id") and not a.once:
-        threading.Thread(target=telegram_listener, args=(client,), daemon=True).start()
         print("Rezerwacja przyciskiem na Telegramie: WŁĄCZONA")
+    if TG.get("bot_token") and TG.get("chat_id") and not a.once:
+        threading.Thread(target=telegram_listener, args=(client, cfg), daemon=True).start()
+        print("Komendy z Telegrama: WŁĄCZONE (/pomoc)")
     seen = load_state()
     interval = cfg.get("interval_minutes", 5)
     fails, alerted = 0, False
     while True:
         try:
             check(client, cfg, seen)
+            STATUS.update(last_ok=time.time(), fails=0, last_error=None)
             if alerted:
                 notify("Lux Med watcher: działa ponownie", "Nasłuch wrócił do normy.")
             fails, alerted = 0, False
         except (requests.RequestException, SystemExit, ValueError, KeyError, RuntimeError) as e:
             fails += 1
+            STATUS.update(fails=fails, last_error=type(e).__name__)
             print("Błąd nasłuchu:", type(e).__name__, e, file=sys.stderr)
             if fails >= 3 and not alerted:
                 alerted = True
@@ -470,7 +577,8 @@ def main():
                        "Nasłuch może nie działać.")
         if a.once:
             break
-        time.sleep(interval * 60 * random.uniform(0.8, 1.2))
+        WAKE.wait(interval * 60 * random.uniform(0.8, 1.2))  # budzik: /wlacz, /wznow, /reset
+        WAKE.clear()
 
 
 if __name__ == "__main__":

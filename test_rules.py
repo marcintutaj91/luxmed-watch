@@ -7,6 +7,7 @@ from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 
+import control
 import luxmed_watch as lw
 import rules
 
@@ -82,6 +83,10 @@ class FakeClient:
 class CheckTests(unittest.TestCase):
     def setUp(self):
         lw.TG.update({"bot_token": "T", "chat_id": "42"})
+        r = mock.patch.object(control, "RUNTIME_FILE", Path(self._testMethodName + ".runtime.json"))
+        r.start()
+        self.addCleanup(r.stop)
+        self.addCleanup(lambda: control.RUNTIME_FILE.unlink(missing_ok=True))
         p = mock.patch.object(lw, "STATE_FILE", Path(self._testMethodName + ".state.json"))
         q = mock.patch.object(lw, "PENDING_FILE", Path(self._testMethodName + ".pending.json"))
         p.start(), q.start()

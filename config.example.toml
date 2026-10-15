@@ -13,6 +13,11 @@ password = ""
 bot_token = ""
 chat_id = ""
 
+# Rezerwacja jednym kliknięciem: powiadomienie na Telegramie dostaje przycisk "Zarezerwuj".
+# Domyślnie wyłączona. Wymaga skonfigurowanego [telegram].
+[booking]
+enabled = false
+
 [[watch]]
 label = "Stomatolog"
 city_id = 1

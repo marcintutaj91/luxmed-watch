@@ -4,3 +4,4 @@ state.json
 __pycache__/
 .venv/
 catalog.json
+pending.json

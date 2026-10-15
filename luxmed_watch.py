@@ -12,12 +12,14 @@ Użycie:
   python luxmed_watch.py watch --once     # jedno sprawdzenie
 """
 import argparse
+import hashlib
 import json
 import os
 import random
 import re
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import uuid
@@ -26,8 +28,13 @@ from pathlib import Path
 
 import requests
 
+import booking
+
 BASE = "https://portalpacjenta.luxmed.pl/PatientPortal"
 STATE_FILE = Path(__file__).with_name("state.json")
+PENDING_FILE = Path(__file__).with_name("pending.json")
+PENDING_LOCK = threading.Lock()
+PENDING_TTL = 24 * 3600
 DEBUG = False
 TG = {}  # {"bot_token": ..., "chat_id": ...}
 
@@ -42,6 +49,7 @@ class Luxmed:
         self.s = requests.Session()
         self.s.headers.update({"Accept": "application/json", "Accept-Language": "pl"})
         self.login, self.password = login, password
+        self.lock = threading.RLock()  # klient jest współdzielony z wątkiem Telegrama
         self.authenticate()
 
     def authenticate(self):
@@ -59,13 +67,8 @@ class Luxmed:
             self.s.headers[k] = v
         self.s.headers["authorization-token"] = f"Bearer {token}"
 
-    def get(self, path, **params):
-        r = self.s.get(f"{BASE}{path}", params=params, timeout=30)
-        if r.status_code == 401 or "json" not in r.headers.get("Content-Type", ""):
-            dbg("sesja wygasła lub zła odpowiedź, loguję ponownie", r.status_code)
-            self.authenticate()
-            r = self.s.get(f"{BASE}{path}", params=params, timeout=30)
-        dbg(path, params, r.status_code, r.text[:500])
+    def _json(self, r):
+        dbg(r.request.method, r.url.split("PatientPortal")[-1], r.status_code, r.text[:500])
         r.raise_for_status()
         try:
             return r.json()
@@ -73,6 +76,27 @@ class Luxmed:
             kind = r.headers.get("Content-Type", "?")
             raise RuntimeError(f"Odpowiedź nie jest JSON-em (HTTP {r.status_code}, {kind}): "
                                f"{r.text[:120]!r}") from None
+
+    def get(self, path, **params):
+        with self.lock:
+            r = self.s.get(f"{BASE}{path}", params=params, timeout=30)
+            if r.status_code == 401 or "json" not in r.headers.get("Content-Type", ""):
+                dbg("sesja wygasła lub zła odpowiedź, loguję ponownie", r.status_code)
+                self.authenticate()
+                r = self.s.get(f"{BASE}{path}", params=params, timeout=30)
+            return self._json(r)
+
+    def post(self, path, body, params=None):
+        """POST z tokenem CSRF (wymagany przez operacje zapisu w portalu)."""
+        with self.lock:
+            for attempt in (1, 2):
+                token = self.get("/NewPortal/security/getforgerytoken")["token"]
+                r = self.s.post(f"{BASE}{path}", json=body, params=params, timeout=30, headers={
+                    "xsrf-token": token, "x-requested-with": "XMLHttpRequest",
+                    "Content-Type": "application/json"})
+                if r.status_code != 401 or attempt == 2:
+                    return self._json(r)
+                self.authenticate()
 
     def cities(self):
         return self.get("/NewPortal/Dictionary/cities")
@@ -92,9 +116,14 @@ class Luxmed:
                "searchDateFrom": date_from, "searchDateTo": date_to,
                "searchDatePreset": (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days,
                "delocalized": "false", "processId": str(uuid.uuid4())})
+        tfs = data.get("termsForService") or {}
+        extra = tfs.get("additionalData") or {}
         out = []
-        for day in (data.get("termsForService") or {}).get("termsForDays") or []:
-            out.extend(day.get("terms") or [])
+        for day in tfs.get("termsForDays") or []:
+            for t in day.get("terms") or []:
+                t["_additional"] = {"isPreparationRequired": extra.get("isPreparationRequired"),
+                                    "preparationItems": extra.get("preparationItems")}
+                out.append(t)
         return out
 
 
@@ -112,7 +141,7 @@ def flatten(node, acc=None):
     return acc
 
 
-def notify(title, msg):
+def notify(title, msg, book_id=None):
     print(f"\n*** {title}\n{msg}\n")
     try:  # powiadomienie macOS
         subprocess.run(["osascript",
@@ -122,13 +151,97 @@ def notify(title, msg):
     except FileNotFoundError:
         pass
     if TG.get("bot_token") and TG.get("chat_id"):
+        data = {"chat_id": TG["chat_id"], "text": f"{title}\n{msg}"}
+        if book_id:
+            data["reply_markup"] = json.dumps({"inline_keyboard": [[
+                {"text": "Zarezerwuj", "callback_data": f"book:{book_id}"}]]})
+        tg_api("sendMessage", **data)
+
+
+def tg_api(method, **data):
+    """Wywołanie API Telegrama; zwraca JSON albo None (błędy tylko logujemy)."""
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG['bot_token']}/{method}", data=data, timeout=15)
+        if not r.ok:
+            print(f"Telegram {method}: błąd {r.status_code}", file=sys.stderr)
+            return None
+        return r.json()
+    except requests.RequestException as e:
+        print(f"Telegram {method}: brak połączenia:", type(e).__name__, file=sys.stderr)
+        return None
+
+
+def load_pending():
+    try:
+        return json.loads(PENDING_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_pending(pending):
+    now = time.time()
+    pending = {k: v for k, v in pending.items() if now - v["ts"] < PENDING_TTL}
+    PENDING_FILE.write_text(json.dumps(pending, ensure_ascii=False))
+    PENDING_FILE.chmod(0o600)
+
+
+def add_pending(key, term, name, label):
+    book_id = hashlib.sha1(key.encode()).hexdigest()[:12]
+    with PENDING_LOCK:
+        pending = load_pending()
+        pending[book_id] = {"term": term, "name": name, "label": label, "ts": time.time()}
+        save_pending(pending)
+    return book_id
+
+
+def handle_callback(client, cb):
+    """Kliknięcie przycisku 'Zarezerwuj' na Telegramie."""
+    if str(cb.get("from", {}).get("id")) != str(TG.get("chat_id")):
+        return  # tylko właściciel bota
+    data = cb.get("data", "")
+    msg = cb.get("message") or {}
+    chat, mid = msg.get("chat", {}).get("id"), msg.get("message_id")
+    if not data.startswith("book:"):
+        return
+    with PENDING_LOCK:  # jedno kliknięcie = jedna próba
+        pending = load_pending()
+        entry = pending.pop(data[5:], None)
+        save_pending(pending)
+    if not entry:
+        tg_api("answerCallbackQuery", callback_query_id=cb["id"], text="Ta oferta wygasła lub już obsłużona.")
+        return
+    tg_api("answerCallbackQuery", callback_query_id=cb["id"], text="Rezerwuję…")
+    summary = format_term(entry["term"], entry["name"])
+    try:
+        booking.book(client, entry["term"])
+        result = f"ZAREZERWOWANO\n{summary}"
+    except booking.BookingError as e:
+        result = f"NIE ZAREZERWOWANO\n{summary}\n{e}"
+    except (requests.RequestException, RuntimeError, KeyError, ValueError) as e:
+        result = f"BŁĄD przy rezerwacji ({type(e).__name__}); sprawdź portal.\n{summary}"
+    print("\n***", result, "\n")
+    if chat and mid:  # zdejmij przycisk i pokaż wynik w tej samej wiadomości
+        tg_api("editMessageText", chat_id=chat, message_id=mid, text=f"Lux Med: {entry['label']}\n{result}")
+    else:
+        tg_api("sendMessage", chat_id=TG["chat_id"], text=result)
+
+
+def telegram_listener(client):
+    offset = None
+    while True:
         try:
-            r = requests.post(f"https://api.telegram.org/bot{TG['bot_token']}/sendMessage",
-                              data={"chat_id": TG["chat_id"], "text": f"{title}\n{msg}"}, timeout=15)
-            if not r.ok:
-                print(f"Telegram: błąd {r.status_code}", file=sys.stderr)
-        except requests.RequestException as e:
-            print("Telegram: brak połączenia:", type(e).__name__, file=sys.stderr)
+            params = {"timeout": 25, "allowed_updates": json.dumps(["callback_query"])}
+            if offset:
+                params["offset"] = offset
+            r = requests.get(f"https://api.telegram.org/bot{TG['bot_token']}/getUpdates",
+                             params=params, timeout=40)
+            for u in r.json().get("result", []):
+                offset = u["update_id"] + 1
+                if u.get("callback_query"):
+                    handle_callback(client, u["callback_query"])
+        except Exception as e:  # wątek nie może paść
+            print("Telegram listener:", type(e).__name__, file=sys.stderr)
+            time.sleep(10)
 
 
 def telegram_setup():
@@ -184,7 +297,8 @@ def format_term(t, name):
     return "\n".join(x for x in lines if x)
 
 
-def check(client, cfg, seen):
+def find_terms(client, cfg):
+    """Wolne terminy pasujące do bloków [[watch]]: (blok, termin, nazwisko lekarza, klucz)."""
     horizon = cfg.get("horizon_days", 60)
     d_from = date.today().isoformat()
     d_to = (date.today() + timedelta(days=horizon)).isoformat()
@@ -200,10 +314,18 @@ def check(client, cfg, seen):
             if clinics and str(t.get("clinicGroupId", t.get("clinicId"))) not in clinics:
                 continue
             key = f"{w['service_id']}|{t.get('dateTimeFrom')}|{doc.get('id')}|{t.get('clinicId')}"
-            if key in seen:
-                continue
-            seen.add(key)
-            notify(f"Lux Med: {w.get('label', w['service_id'])}", format_term(t, name))
+            yield w, t, name, key
+
+
+def check(client, cfg, seen):
+    can_book = bool(cfg.get("booking", {}).get("enabled")) and bool(TG.get("bot_token") and TG.get("chat_id"))
+    for w, t, name, key in find_terms(client, cfg):
+        if key in seen:
+            continue
+        seen.add(key)
+        label = w.get("label", w["service_id"])
+        book_id = add_pending(key, t, name, label) if can_book else None
+        notify(f"Lux Med: {label}", format_term(t, name), book_id)
     STATE_FILE.write_text(json.dumps(sorted(seen)))
 
 
@@ -223,6 +345,7 @@ def main():
     e.add_argument("--filter", action="append", required=True,
                    help="fragment nazwy usługi, można podać wielokrotnie, np. --filter stomat --filter dermat")
     sub.add_parser("telegram", help="znajdź chat_id i wyślij wiadomość testową")
+    sub.add_parser("book-test", help="test rezerwacji bez potwierdzenia: zablokuj pierwszy pasujący termin i zwolnij")
     w = sub.add_parser("watch")
     w.add_argument("--once", action="store_true")
     a = ap.parse_args()
@@ -290,6 +413,20 @@ def main():
 
     if "watch" not in cfg:
         raise SystemExit("Brak bloków [[watch]] w config.toml.")
+
+    if a.cmd == "book-test":
+        for w, t, name, key in find_terms(client, cfg):
+            print("Testuję na terminie:\n" + format_term(t, name))
+            try:
+                print("Wynik:", booking.book(client, t, dry_run=True))
+            except booking.BookingError as e:
+                print("Odmowa:", e)
+            return
+        raise SystemExit("Brak wolnych terminów pasujących do configu: nie ma na czym testować.")
+
+    if cfg.get("booking", {}).get("enabled") and TG.get("bot_token") and TG.get("chat_id") and not a.once:
+        threading.Thread(target=telegram_listener, args=(client,), daemon=True).start()
+        print("Rezerwacja przyciskiem na Telegramie: WŁĄCZONA")
     seen = load_state()
     interval = cfg.get("interval_minutes", 5)
     fails, alerted = 0, False

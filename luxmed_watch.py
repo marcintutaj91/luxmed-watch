@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Nasłuch wolnych terminów w portalu pacjenta Lux Med. Tylko powiadamia, nie rezerwuje.
+"""Nasłuch wolnych terminów w portalu pacjenta Lux Med (jedno lub kilka kont naraz).
 
-UWAGA: endpointy to NIEOFICJALNE API portalu (wzorowane na projekcie LuxmedSniper).
-Mogą się zmienić. Przy pierwszym uruchomieniu użyj --debug, żeby zobaczyć surowe odpowiedzi.
+Powiadamia na macOS i Telegramie, a rezerwuje tylko na Twoje kliknięcie (przycisk "Zarezerwuj").
+Konta, bloki [[watch]], Telegram i rezerwacja: patrz config.example.toml.
+
+UWAGA: endpointy to NIEOFICJALNE API portalu (wzorowane na projektach LuxmedSniper i luxmed-bot).
+Mogą się zmienić. Regulamin Lux Med zabrania korzystania z portalu przez aplikacje spoza Lux Med.
+Przy problemach użyj --debug, żeby zobaczyć surowe odpowiedzi.
 
 Użycie:
-  python luxmed_watch.py discover cities
+  python luxmed_watch.py watch                      # aktywne konta z configu (active_account)
+  python luxmed_watch.py --account zona watch       # tylko to konto; też "marcin,zona" albo "wszystkie"
+  python luxmed_watch.py watch --once               # jedno sprawdzenie
+  python luxmed_watch.py --account zona discover cities
   python luxmed_watch.py discover services stomat
-  python luxmed_watch.py discover doctors --city 1 --service 4502
-  python luxmed_watch.py watch            # pętla
-  python luxmed_watch.py watch --once     # jedno sprawdzenie
+  python luxmed_watch.py book-test                  # test blokady terminu bez rezerwacji
 """
 import argparse
 import hashlib
@@ -35,14 +40,11 @@ import rules
 from rules import DNI
 
 BASE = "https://portalpacjenta.luxmed.pl/PatientPortal"
-STATE_FILE = Path(__file__).with_name("state.json")
-PENDING_FILE = Path(__file__).with_name("pending.json")
 PENDING_LOCK = threading.Lock()
 PENDING_TTL = 24 * 3600
-ACCOUNT = {"name": "default", "multi": False, "booking": True}  # ustawiane w main()
-STATUS = {"last_ok": None, "fails": 0, "last_error": None}
 WAKE = threading.Event()  # przerywa oczekiwanie między sprawdzeniami (np. po /wlacz)
 COMMAND_MAX_AGE = 120  # ignoruj komendy starsze niż tyle sekund (np. zaległe po restarcie)
+MAX_PER_MESSAGE = 10  # reszta trafi do kolejnej wiadomości w następnej rundzie
 DEBUG = False
 TG = {}  # {"bot_token": ..., "chat_id": ...}
 
@@ -151,14 +153,47 @@ def flatten(node, acc=None):
     return acc
 
 
-def acct_tag():
-    """'[zona] ' gdy skonfigurowano kilka kont, żeby było wiadomo, czyje to powiadomienie."""
-    return f"[{ACCOUNT['name']}] " if ACCOUNT["multi"] else ""
+def load_state(path):
+    try:
+        return set(json.loads(Path(path).read_text()))
+    except (FileNotFoundError, ValueError):
+        return set()
 
 
-def notify(title, msg, buttons=None):
-    """buttons: lista (tekst, book_id); każdy przycisk w osobnym wierszu."""
-    title = acct_tag() + title
+class Ctx:
+    """Jedno konto: leniwie tworzony klient, jego bloki [[watch]], własne pliki stanu i status działania."""
+
+    def __init__(self, name, cfg, multi, client=None):
+        self.name, self.cfg, self.multi = name, cfg, multi
+        self.blocks = accounts.blocks_for(cfg, name)
+        self.files = accounts.paths(name)
+        self.booking = accounts.booking_allowed(cfg, name)
+        self.seen = load_state(self.files["state"])
+        self.status = {"last_ok": None, "fails": 0, "last_error": None}
+        self.alerted = False
+        self._client = client
+        self._lock = threading.Lock()
+
+    @property
+    def tag(self):
+        """'[zona] ' gdy skonfigurowano kilka kont, żeby było wiadomo, czyje to powiadomienie."""
+        return f"[{self.name}] " if self.multi else ""
+
+    @property
+    def runtime(self):
+        return self.files["runtime"]
+
+    @property
+    def client(self):
+        with self._lock:
+            if self._client is None:
+                self._client = Luxmed(*accounts.credentials(self.cfg, self.name))
+            return self._client
+
+
+def notify(title, msg, buttons=None, tag=""):
+    """buttons: lista (tekst, callback_data); każdy przycisk w osobnym wierszu."""
+    title = tag + title
     print(f"\n*** {title}\n{msg}\n")
     try:  # powiadomienie macOS
         subprocess.run(["osascript",
@@ -171,7 +206,7 @@ def notify(title, msg, buttons=None):
         data = {"chat_id": TG["chat_id"], "text": f"{title}\n{msg}"}
         if buttons:
             data["reply_markup"] = json.dumps({"inline_keyboard": [
-                [{"text": text, "callback_data": f"book:{bid}"}] for text, bid in buttons]})
+                [{"text": text, "callback_data": cb}] for text, cb in buttons]})
         tg_api("sendMessage", **data)
 
 
@@ -188,62 +223,90 @@ def tg_api(method, **data):
         return None
 
 
-def load_pending():
+def reply(text):
+    tg_api("sendMessage", chat_id=TG["chat_id"], text=text)
+
+
+def load_pending(path):
     try:
-        return json.loads(PENDING_FILE.read_text())
+        return json.loads(Path(path).read_text())
     except (FileNotFoundError, ValueError):
         return {}
 
 
-def save_pending(pending):
+def save_pending(path, pending):
     now = time.time()
     pending = {k: v for k, v in pending.items() if now - v["ts"] < PENDING_TTL}
-    PENDING_FILE.write_text(json.dumps(pending, ensure_ascii=False))
-    PENDING_FILE.chmod(0o600)
+    Path(path).write_text(json.dumps(pending, ensure_ascii=False))
+    Path(path).chmod(0o600)
 
 
-def add_pending(key, term, name, label):
-    book_id = hashlib.sha1(key.encode()).hexdigest()[:12]
+def add_pending(ctx, key, term, name, label):
+    """Zapisuje ofertę rezerwacji konta i zwraca callback_data przycisku: book:<konto>:<id>."""
+    book_id = hashlib.sha1(f"{ctx.name}|{key}".encode()).hexdigest()[:12]
     with PENDING_LOCK:
-        pending = load_pending()
+        pending = load_pending(ctx.files["pending"])
         pending[book_id] = {"term": term, "name": name, "label": label, "ts": time.time()}
-        save_pending(pending)
-    return book_id
+        save_pending(ctx.files["pending"], pending)
+    return f"book:{ctx.name}:{book_id}"
 
 
-def handle_callback(client, cb):
-    """Kliknięcie przycisku 'Zarezerwuj' na Telegramie."""
+def can_book_now(cfg, ctx):
+    return (bool(cfg.get("booking", {}).get("enabled")) and ctx.booking
+            and bool(TG.get("bot_token") and TG.get("chat_id")))
+
+
+def find_ctx(ctxs, name):
+    return next((c for c in ctxs if c.name.lower() == str(name).strip().lower()), None)
+
+
+def handle_callback(ctxs, cfg, cb):
+    """Kliknięcie przycisku 'Zarezerwuj': rezerwuje na koncie, do którego należy oferta."""
     if str(cb.get("from", {}).get("id")) != str(TG.get("chat_id")):
         return  # tylko właściciel bota
-    data = cb.get("data", "")
+    parts = cb.get("data", "").split(":")
     msg = cb.get("message") or {}
     chat, mid = msg.get("chat", {}).get("id"), msg.get("message_id")
-    if not data.startswith("book:"):
+    if parts[0] != "book" or len(parts) not in (2, 3):
+        return
+    if len(parts) == 3:
+        ctx, book_id = find_ctx(ctxs, parts[1]), parts[2]
+    else:  # stary format book:<id> z wiadomości sprzed trybu wielu kont
+        book_id = parts[1]
+        ctx = next((c for c in ctxs if book_id in load_pending(c.files["pending"])), None)
+    if ctx is None:
+        tg_api("answerCallbackQuery", callback_query_id=cb["id"],
+               text="Oferta wygasła albo dotyczy konta, które nie jest teraz aktywne.")
+        return
+    if not can_book_now(cfg, ctx):
+        tg_api("answerCallbackQuery", callback_query_id=cb["id"],
+               text=f"Rezerwacja przyciskiem jest wyłączona dla konta {ctx.name}.")
         return
     with PENDING_LOCK:  # jedno kliknięcie = jedna próba
-        pending = load_pending()
-        entry = pending.pop(data[5:], None)
-        save_pending(pending)
+        pending = load_pending(ctx.files["pending"])
+        entry = pending.pop(book_id, None)
+        save_pending(ctx.files["pending"], pending)
     if not entry:
-        tg_api("answerCallbackQuery", callback_query_id=cb["id"], text="Oferta wygasła, była już obsłużona albo dotyczy innego konta.")
+        tg_api("answerCallbackQuery", callback_query_id=cb["id"], text="Oferta wygasła lub była już obsłużona.")
         return
-    tg_api("answerCallbackQuery", callback_query_id=cb["id"], text="Rezerwuję…")
+    tg_api("answerCallbackQuery", callback_query_id=cb["id"], text=f"Rezerwuję ({ctx.name})…")
     summary = format_term(entry["term"], entry["name"])
     try:
-        booking.book(client, entry["term"])
+        booking.book(ctx.client, entry["term"])
         result = f"ZAREZERWOWANO\n{summary}"
     except booking.BookingError as e:
         result = f"NIE ZAREZERWOWANO\n{summary}\n{e}"
-    except (requests.RequestException, RuntimeError, KeyError, ValueError) as e:
+    except (requests.RequestException, RuntimeError, KeyError, ValueError, SystemExit) as e:
         result = f"BŁĄD przy rezerwacji ({type(e).__name__}); sprawdź portal.\n{summary}"
-    print("\n***", result, "\n")
-    if chat and mid:  # zdejmij przycisk i pokaż wynik w tej samej wiadomości
-        tg_api("editMessageText", chat_id=chat, message_id=mid, text=f"{acct_tag()}Lux Med: {entry['label']}\n{result}")
+    print("\n***", ctx.tag, result, "\n")
+    if chat and mid:  # zdejmij przyciski i pokaż wynik w tej samej wiadomości
+        tg_api("editMessageText", chat_id=chat, message_id=mid,
+               text=f"{ctx.tag}Lux Med: {entry['label']}\n{result}")
     else:
-        tg_api("sendMessage", chat_id=TG["chat_id"], text=result)
+        tg_api("sendMessage", chat_id=TG["chat_id"], text=f"{ctx.tag}{result}")
 
 
-def telegram_listener(client, cfg):
+def telegram_listener(ctxs, cfg):
     tg_api("setMyCommands", commands=json.dumps(
         [{"command": c, "description": d} for c, d in control.COMMANDS], ensure_ascii=False))
     offset = None
@@ -257,9 +320,9 @@ def telegram_listener(client, cfg):
             for u in r.json().get("result", []):
                 offset = u["update_id"] + 1
                 if u.get("callback_query"):
-                    handle_callback(client, u["callback_query"])
+                    handle_callback(ctxs, cfg, u["callback_query"])
                 elif u.get("message"):
-                    handle_message(client, cfg, u["message"])
+                    handle_message(ctxs, cfg, u["message"])
         except Exception as e:  # wątek nie może paść
             print("Telegram listener:", type(e).__name__, file=sys.stderr)
             time.sleep(10)
@@ -289,13 +352,6 @@ def telegram_setup():
     print("Wysłano." if r.ok else f"Błąd wysyłki: HTTP {r.status_code}")
 
 
-def load_state():
-    try:
-        return set(json.loads(STATE_FILE.read_text()))
-    except (FileNotFoundError, ValueError):
-        return set()
-
-
 def format_term(t, name):
     """Czytelny opis terminu: 'czw 15.10, 17:20 (40 min) · jutro'."""
     start = datetime.fromisoformat(t["dateTimeFrom"])
@@ -315,18 +371,18 @@ def format_term(t, name):
     return "\n".join(x for x in lines if x)
 
 
-def find_terms(client, cfg):
-    """Wolne terminy pasujące do bloków [[watch]]: (blok, termin, nazwisko lekarza, klucz)."""
+def find_terms(ctx, cfg):
+    """Wolne terminy pasujące do bloków [[watch]] konta: (blok, termin, nazwisko lekarza, klucz)."""
     horizon = cfg.get("horizon_days", 60)
     d_from = date.today().isoformat()
     d_to = (date.today() + timedelta(days=horizon)).isoformat()
-    for w in cfg["watch"]:
-        if not control.block_enabled(w):
+    for w in ctx.blocks:
+        if not control.block_enabled(w, ctx.runtime):
             continue  # enabled = false w configu albo /wylacz z Telegrama
         doctors = [d.lower() for d in w.get("doctors", [])]
         clinics = {str(c) for c in w.get("clinic_ids", [])}
         flt = rules.parse_filter(w)
-        terms = client.terms(w["city_id"], w.get("city_name", ""), w["service_id"], d_from, d_to)
+        terms = ctx.client.terms(w["city_id"], w.get("city_name", ""), w["service_id"], d_from, d_to)
         for t in terms:
             doc = t.get("doctor") or {}
             name = f"{doc.get('firstName', '')} {doc.get('lastName', '')}".strip()
@@ -340,103 +396,132 @@ def find_terms(client, cfg):
             yield w, t, name, key
 
 
-MAX_PER_MESSAGE = 10  # reszta trafi do kolejnej wiadomości w następnej rundzie
-
-
-def can_book_now(cfg):
-    return (bool(cfg.get("booking", {}).get("enabled")) and ACCOUNT["booking"]
-            and bool(TG.get("bot_token") and TG.get("chat_id")))
-
-
-def collect_groups(client, cfg, seen):
+def collect_groups(ctx, cfg, seen=None):
+    seen = ctx.seen if seen is None else seen
     groups = {}  # (blok, lekarz) -> [(termin, klucz)]
     claimed = set()  # ten sam termin może pasować do kilku bloków: wygrywa pierwszy z configu
-    for w, t, name, key in find_terms(client, cfg):
+    for w, t, name, key in find_terms(ctx, cfg):
         if key not in seen and key not in claimed:
             claimed.add(key)
             groups.setdefault((id(w), w.get("label", w["service_id"]), name), []).append((t, key))
     return groups
 
 
-def send_groups(groups, can_book, seen=None, limit=None):
+def send_groups(ctx, cfg, groups, seen=None, limit=None):
+    can_book = can_book_now(cfg, ctx)
     for n, ((_, label, name), items) in enumerate(groups.items()):
         if limit is not None and n >= limit:
             break
         items.sort(key=lambda x: x[0]["dateTimeFrom"])
         items = items[:MAX_PER_MESSAGE]
         body, labels = rules.format_group(name, [t for t, _ in items])
-        buttons = [(text, add_pending(key, t, name, label))
+        buttons = [(text, add_pending(ctx, key, t, name, label))
                    for text, (t, key) in zip(labels, items)] if can_book else None
         if seen is not None:
             seen.update(key for _, key in items)
-        notify(f"Lux Med: {label}", body, buttons)
+        notify(f"Lux Med: {label}", body, buttons, tag=ctx.tag)
 
 
-def check(client, cfg, seen):
-    if control.is_paused():
+def check(ctx, cfg):
+    if control.is_paused(ctx.runtime):
         return
-    send_groups(collect_groups(client, cfg, seen), can_book_now(cfg), seen)
-    STATE_FILE.write_text(json.dumps(sorted(seen)))
+    send_groups(ctx, cfg, collect_groups(ctx, cfg), ctx.seen)
+    ctx.files["state"].write_text(json.dumps(sorted(ctx.seen)))
 
 
-def reply(text):
-    tg_api("sendMessage", chat_id=TG["chat_id"], text=text)
+def run_check(ctx, cfg):
+    """Jedno sprawdzenie konta; błąd jednego konta nie zatrzymuje pozostałych."""
+    try:
+        check(ctx, cfg)
+        ctx.status.update(last_ok=time.time(), fails=0, last_error=None)
+        if ctx.alerted:
+            notify("Lux Med watcher: działa ponownie", "Nasłuch wrócił do normy.", tag=ctx.tag)
+        ctx.alerted = False
+    except (requests.RequestException, SystemExit, ValueError, KeyError, RuntimeError) as e:
+        fails = ctx.status["fails"] + 1
+        ctx.status.update(fails=fails, last_error=type(e).__name__)
+        print(f"Błąd nasłuchu{' ' + ctx.name if ctx.multi else ''}:", type(e).__name__, e, file=sys.stderr)
+        if fails >= 3 and not ctx.alerted:
+            ctx.alerted = True
+            notify("Lux Med watcher: PROBLEM",
+                   f"{fails} nieudane sprawdzenia z rzędu ({type(e).__name__}). Nasłuch może nie działać.",
+                   tag=ctx.tag)
 
 
-def status_text(cfg):
-    lines = [f"Nasłuch działa. Konto: {ACCOUNT['name']}"]
-    if STATUS["last_ok"]:
-        ago = int((time.time() - STATUS["last_ok"]) // 60)
-        lines.append(f"Ostatnie udane sprawdzenie: {datetime.fromtimestamp(STATUS['last_ok']):%H:%M:%S} ({ago} min temu)")
-    else:
-        lines.append("Od startu nie było jeszcze udanego sprawdzenia.")
-    if STATUS["fails"]:
-        lines.append(f"Nieudane sprawdzenia z rzędu: {STATUS['fails']} ({STATUS['last_error']})")
-    lines.append("Powiadomienia: WSTRZYMANE (/wznow)" if control.is_paused() else "Powiadomienia: włączone")
-    lines.append("Rezerwacja przyciskiem: " + ("włączona" if can_book_now(cfg) else "wyłączona"))
-    lines.append(f"Sprawdzam co ok. {cfg.get('interval_minutes', 5)} min\n")
-    lines.append(control.describe_blocks(cfg))
+def pick_targets(ctxs, arg):
+    """Opcjonalna nazwa konta na początku argumentu: (konta, reszta, czy_wskazano_konto)."""
+    first, _, rest = arg.partition(" ")
+    ctx = find_ctx(ctxs, first) if first else None
+    return ([ctx], rest.strip(), True) if ctx else (ctxs, arg, False)
+
+
+def blocks_text(ctxs):
+    multi = len(ctxs) > 1
+    return "\n\n".join((f"{c.tag.strip()}\n" if multi else "") + control.describe_blocks(c.blocks, c.runtime)
+                        for c in ctxs)
+
+
+def status_text(ctxs, cfg):
+    lines = [f"Nasłuch działa. Aktywne konta: {', '.join(c.name for c in ctxs)}. "
+             f"Sprawdzam co ok. {cfg.get('interval_minutes', 5)} min."]
+    for c in ctxs:
+        lines.append("")
+        if len(ctxs) > 1:
+            lines.append(f"[{c.name}]")
+        st = c.status
+        if st["last_ok"]:
+            ago = int((time.time() - st["last_ok"]) // 60)
+            lines.append(f"Ostatnie udane sprawdzenie: {datetime.fromtimestamp(st['last_ok']):%H:%M:%S} ({ago} min temu)")
+        else:
+            lines.append("Od startu nie było jeszcze udanego sprawdzenia.")
+        if st["fails"]:
+            lines.append(f"Nieudane sprawdzenia z rzędu: {st['fails']} ({st['last_error']})")
+        lines.append("Powiadomienia: WSTRZYMANE (/wznow)" if control.is_paused(c.runtime) else "Powiadomienia: włączone")
+        lines.append("Rezerwacja przyciskiem: " + ("włączona" if can_book_now(cfg, c) else "wyłączona"))
+        lines.append(control.describe_blocks(c.blocks, c.runtime))
     return "\n".join(lines)
 
 
-def toggle_block(cfg, arg, value):
-    if not arg:
-        return "Podaj nazwę bloku, np. /wlacz derm\n\n" + control.describe_blocks(cfg)
-    found = control.find_blocks(cfg, arg)
+def toggle_block(ctxs, arg, value):
+    targets, phrase, _ = pick_targets(ctxs, arg)
+    if not phrase:
+        return "Podaj nazwę bloku, np. /wlacz derm\n\n" + blocks_text(targets)
+    found = [(c, w) for c in targets for w in control.find_blocks(c.blocks, phrase)]
     if not found:
-        return f"Nie znalazłem bloku pasującego do „{arg}”.\n\n" + control.describe_blocks(cfg)
+        return f"Nie znalazłem bloku pasującego do „{phrase}”.\n\n" + blocks_text(targets)
     if len(found) > 1:
-        names = "\n".join("• " + control.label_of(w) for w in found)
-        return f"„{arg}” pasuje do kilku bloków, doprecyzuj:\n{names}"
-    control.set_block(found[0], value)
+        names = "\n".join(f"• {c.tag}{control.label_of(w)}" for c, w in found)
+        hint = "\nPrzy kilku kontach dodaj nazwę konta, np. /wlacz zona derm." if len(ctxs) > 1 else ""
+        return f"„{phrase}” pasuje do kilku bloków, doprecyzuj:\n{names}{hint}"
+    c, w = found[0]
+    control.set_block(w, value, c.runtime)
     WAKE.set()  # sprawdź od razu, nie czekaj na koniec interwału
     state = "WŁĄCZONY (sprawdzę terminy od razu)" if value else "wyłączony"
-    return f"{control.label_of(found[0])}: {state}"
+    return f"{c.tag}{control.label_of(w)}: {state}"
 
 
-def switch_account(cfg, arg):
-    names = list(accounts.list_accounts(cfg))
-    current = f"Aktywne konto: {ACCOUNT['name']}. Dostępne: {', '.join(names)}."
+def switch_account(ctxs, cfg, arg):
+    defined = list(accounts.list_accounts(cfg))
+    active = [c.name for c in ctxs]
+    status = f"Aktywne konta: {', '.join(active)}. Dostępne: {', '.join(defined)}."
     if not arg:
-        return current + ("\nPrzełączenie: /konto <nazwa>" if len(names) > 1 else "")
+        return status + ("\nZmiana: /konto <nazwa> albo /konto wszystkie" if len(defined) > 1 else "")
     try:
-        target = accounts._match(names, arg)
-    except accounts.AccountError as e:
-        return str(e)
-    if target == ACCOUNT["name"]:
-        return f"Konto {target} jest już aktywne."
-    try:
-        accounts.credentials(cfg, target)
-        accounts.blocks_for(cfg, target)
+        target = accounts.selected_names(cfg, cli=arg, environ={})
+        for name in target:
+            accounts.credentials(cfg, name)
+            accounts.blocks_for(cfg, name)
     except accounts.AccountError as e:
         return f"Nie przełączam: {e}"
-    accounts.set_selected(target)
+    if target == active:
+        return f"Aktywne już są: {', '.join(active)}."
+    accounts.set_selected("all" if target == defined and len(defined) > 1 else target[0] if len(target) == 1 else target)
     threading.Timer(1.5, os._exit, args=(0,)).start()  # launchd uruchomi nasłuch ponownie (ok. 30 s)
-    return (f"Przełączam na konto {target}. Nasłuch uruchomi się ponownie (ok. 30 s). "
+    return (f"Przełączam na: {', '.join(target)}. Nasłuch uruchomi się ponownie (ok. 30 s). "
             "Jeśli nie działa jako usługa, uruchom go ręcznie.")
 
 
-def handle_message(client, cfg, msg):
+def handle_message(ctxs, cfg, msg):
     """Komendy z Telegrama; tylko od właściciela bota."""
     if str(msg.get("from", {}).get("id")) != str(TG.get("chat_id")):
         return
@@ -446,39 +531,51 @@ def handle_message(client, cfg, msg):
     if not parsed:
         return
     cmd, arg = parsed
+    targets, rest, picked = pick_targets(ctxs, arg)
+    if cmd in ("pauza", "wznow", "reset", "terminy") and arg and not picked:
+        reply(f"Nieznane konto „{arg}”. Aktywne: {', '.join(c.name for c in ctxs)}.")
+        return
+    names = ", ".join(c.name for c in targets) if len(ctxs) > 1 else ""
+    suffix = f" ({names})" if names else ""
     if cmd in ("start", "pomoc", "help"):
         reply(control.HELP)
     elif cmd == "status":
-        reply(status_text(cfg))
+        reply(status_text(ctxs, cfg))
     elif cmd == "bloki":
-        reply(control.describe_blocks(cfg))
+        reply(blocks_text(ctxs))
     elif cmd == "konto":
-        reply(switch_account(cfg, arg))
+        reply(switch_account(ctxs, cfg, arg))
     elif cmd in ("wlacz", "wylacz"):
-        reply(toggle_block(cfg, arg, cmd == "wlacz"))
+        reply(toggle_block(ctxs, arg, cmd == "wlacz"))
     elif cmd == "pauza":
-        control.set_paused(True)
-        reply("Powiadomienia wstrzymane. Wznowisz komendą /wznow. /terminy nadal działa.")
+        for c in targets:
+            control.set_paused(True, c.runtime)
+        reply(f"Powiadomienia wstrzymane{suffix}. Wznowisz komendą /wznow. /terminy nadal działa.")
     elif cmd == "wznow":
-        control.set_paused(False)
+        for c in targets:
+            control.set_paused(False, c.runtime)
         WAKE.set()
-        reply("Powiadomienia wznowione, sprawdzam terminy.")
+        reply(f"Powiadomienia wznowione{suffix}, sprawdzam terminy.")
     elif cmd == "reset":
-        control.reset()
+        for c in targets:
+            control.reset(c.runtime)
         WAKE.set()
-        reply("Przywrócono ustawienia z config.toml (koniec pauzy i ręcznych przełączeń).")
+        reply(f"Przywrócono ustawienia z config.toml{suffix} (koniec pauzy i ręcznych przełączeń).")
     elif cmd == "terminy":
-        try:
-            groups = collect_groups(client, cfg, set())
-        except (requests.RequestException, RuntimeError, KeyError, ValueError) as e:
-            reply(f"Nie udało się pobrać terminów ({type(e).__name__}).")
-            return
-        if not groups:
+        sent = False
+        for c in targets:
+            try:
+                groups = collect_groups(c, cfg, set())
+            except (requests.RequestException, RuntimeError, KeyError, ValueError, SystemExit) as e:
+                reply(f"{c.tag}Nie udało się pobrać terminów ({type(e).__name__}).")
+                continue
+            if groups:
+                sent = True
+                send_groups(c, cfg, groups, None, limit=6)
+                if len(groups) > 6:
+                    reply(f"{c.tag}…i {len(groups) - 6} kolejnych lekarzy. Zawęź listę blokami (/bloki).")
+        if not sent:
             reply("Brak wolnych terminów dla włączonych bloków.")
-            return
-        send_groups(groups, can_book_now(cfg), None, limit=6)
-        if len(groups) > 6:
-            reply(f"…i {len(groups) - 6} kolejnych lekarzy. Zawęź listę blokami (/bloki).")
     else:
         reply("Nieznana komenda. /pomoc pokaże listę.")
 
@@ -488,7 +585,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--config", default=str(Path(__file__).with_name("config.toml")))
-    ap.add_argument("--account", help="konto z [accounts.*] (domyślnie: active_account z configu)")
+    ap.add_argument("--account", help="konto z [accounts.*], kilka po przecinku albo 'wszystkie' "
+                                      "(domyślnie: active_account z configu)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("discover")
     d.add_argument("what", choices=["cities", "services", "doctors"])
@@ -513,30 +611,27 @@ def main():
         raise SystemExit(f"Błąd w {cfg_path.name}: {ex}\n"
                          "Wartości tekstowe muszą być w apostrofach lub cudzysłowie, "
                          "np. login = 'abc'.")
-    auth = cfg.get("auth", {})
     TG.update({"bot_token": cfg.get("telegram", {}).get("bot_token") or os.getenv("TELEGRAM_BOT_TOKEN"),
                "chat_id": cfg.get("telegram", {}).get("chat_id") or os.getenv("TELEGRAM_CHAT_ID")})
     if a.cmd == "telegram":
         telegram_setup()
         return
+    single = a.cmd != "watch"  # discover, export i book-test działają na jednym koncie
     try:
         if not accounts.list_accounts(cfg) and os.getenv("LUXMED_LOGIN") and os.getenv("LUXMED_PASSWORD"):
             cfg["auth"] = {"login": os.getenv("LUXMED_LOGIN"), "password": os.getenv("LUXMED_PASSWORD")}
-        name = accounts.selected_name(cfg, cli=a.account)
-        login, pw = accounts.credentials(cfg, name)
-        cfg["watch"] = accounts.blocks_for(cfg, name)
-        files = accounts.paths(name)
+        names = [accounts.selected_name(cfg, cli=a.account)] if single else accounts.selected_names(cfg, cli=a.account)
+        multi = len(accounts.list_accounts(cfg)) > 1
+        ctxs = [Ctx(n, cfg, multi) for n in names]
+        for c in ctxs:
+            accounts.credentials(cfg, c.name)  # brak danych = błąd od razu, nie po godzinie
     except accounts.AccountError as ex:
         raise SystemExit(f"Konta: {ex}")
-    global STATE_FILE, PENDING_FILE
-    STATE_FILE, PENDING_FILE, control.RUNTIME_FILE = files["state"], files["pending"], files["runtime"]
-    ACCOUNT.update(name=name, multi=len(accounts.list_accounts(cfg)) > 1,
-                   booking=accounts.booking_allowed(cfg, name))
-    if ACCOUNT["multi"]:
-        print(f"Aktywne konto: {name}")
-    client = Luxmed(login, pw)
+    if multi:
+        print(f"Aktywne konta: {', '.join(names)}")
 
     if a.cmd == "discover":
+        client = ctxs[0].client
         if a.what == "doctors":
             data = client.doctors(a.city, a.service)
             for doc in data.get("doctors", []):
@@ -549,6 +644,7 @@ def main():
         return
 
     if a.cmd == "export":
+        client = ctxs[0].client
         city = next((c for c in flatten(client.cities()) if str(c["id"]) == str(a.city)), None)
         if not city:
             raise SystemExit(f"Nie znaleziono miasta o ID {a.city}.")
@@ -576,50 +672,38 @@ def main():
               f"{sum(len(v) for v in doctors.values())} pozycji lekarzy.")
         return
 
-    if not cfg.get("watch"):
-        raise SystemExit(f"Brak bloków [[watch]] w config.toml dla konta {ACCOUNT['name']} "
-                         "(dodaj blok, np. z account = \"nazwa\").")
-
+    if not any(c.blocks for c in ctxs):
+        raise SystemExit(f"Brak bloków [[watch]] dla aktywnych kont ({', '.join(names)}). "
+                         "Dodaj blok, np. z account = \"nazwa\".")
     try:
-        for w_ in cfg["watch"]:
-            rules.parse_filter(w_)
+        for c in ctxs:
+            for w_ in c.blocks:
+                rules.parse_filter(w_)
     except rules.ConfigError as ex:
         raise SystemExit(f"Błąd w config.toml: {ex}")
 
     if a.cmd == "book-test":
-        for w, t, name, key in find_terms(client, cfg):
+        ctx = ctxs[0]
+        for w, t, name, key in find_terms(ctx, cfg):
             print("Testuję na terminie:\n" + format_term(t, name))
             try:
-                print("Wynik:", booking.book(client, t, dry_run=True))
+                print("Wynik:", booking.book(ctx.client, t, dry_run=True))
             except booking.BookingError as e:
                 print("Odmowa:", e)
             return
         raise SystemExit("Brak wolnych terminów pasujących do configu: nie ma na czym testować.")
 
-    if cfg.get("booking", {}).get("enabled") and TG.get("bot_token") and TG.get("chat_id") and not a.once:
-        print("Rezerwacja przyciskiem na Telegramie: WŁĄCZONA")
     if TG.get("bot_token") and TG.get("chat_id") and not a.once:
-        threading.Thread(target=telegram_listener, args=(client, cfg), daemon=True).start()
+        if cfg.get("booking", {}).get("enabled"):
+            print("Rezerwacja przyciskiem na Telegramie: WŁĄCZONA (dla kont bez booking = false)")
+        threading.Thread(target=telegram_listener, args=(ctxs, cfg), daemon=True).start()
         print("Komendy z Telegrama: WŁĄCZONE (/pomoc)")
-    seen = load_state()
     interval = cfg.get("interval_minutes", 5)
-    fails, alerted = 0, False
     while True:
-        try:
-            check(client, cfg, seen)
-            STATUS.update(last_ok=time.time(), fails=0, last_error=None)
-            if alerted:
-                notify("Lux Med watcher: działa ponownie", "Nasłuch wrócił do normy.")
-            fails, alerted = 0, False
-        except (requests.RequestException, SystemExit, ValueError, KeyError, RuntimeError) as e:
-            fails += 1
-            STATUS.update(fails=fails, last_error=type(e).__name__)
-            print("Błąd nasłuchu:", type(e).__name__, e, file=sys.stderr)
-            if fails >= 3 and not alerted:
-                alerted = True
-                notify("Lux Med watcher: PROBLEM",
-                       f"{fails} nieudane sprawdzenia z rzędu ({type(e).__name__}). "
-                       "Nasłuch może nie działać.")
+        for i, ctx in enumerate(ctxs):
+            if i:
+                time.sleep(random.uniform(2, 5))  # nie wysyłaj zapytań obu kont naraz
+            run_check(ctx, cfg)
         if a.once:
             break
         WAKE.wait(interval * 60 * random.uniform(0.8, 1.2))  # budzik: /wlacz, /wznow, /reset

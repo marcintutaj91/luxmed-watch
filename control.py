@@ -13,14 +13,16 @@ _LOCK = threading.Lock()
 
 HELP = """Komendy:
 /status - czy działa i kiedy było ostatnie sprawdzenie
-/terminy - aktualne wolne terminy (z przyciskami)
+/terminy [konto] - aktualne wolne terminy (z przyciskami)
 /bloki - lista obserwowanych bloków i ich stan
-/wlacz <nazwa> - włącz blok, np. /wlacz derm
-/wylacz <nazwa> - wyłącz blok
-/pauza - wstrzymaj powiadomienia
-/wznow - wznów powiadomienia
-/konto - pokaż lub przełącz konto (np. /konto zona)
-/reset - wróć do ustawień z config.toml"""
+/wlacz [konto] <nazwa> - włącz blok, np. /wlacz zona derm
+/wylacz [konto] <nazwa> - wyłącz blok
+/pauza [konto] - wstrzymaj powiadomienia (bez konta: wszystkie)
+/wznow [konto] - wznów powiadomienia
+/konto - pokaż aktywne konta; /konto zona, /konto wszystkie
+/reset [konto] - wróć do ustawień z config.toml
+
+Przy kilku kontach nazwę konta podajesz przed frazą, np. /wlacz zona derm."""
 
 COMMANDS = [  # do menu Telegrama (tylko małe litery łacińskie, cyfry i _)
     ("status", "Czy działa i kiedy ostatnie sprawdzenie"),
@@ -41,65 +43,70 @@ def _ascii(text):
     return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
 
 
-def _load():
+def _path(path):
+    """Plik stanu danego konta; bez argumentu: RUNTIME_FILE (jedno konto / testy)."""
+    return Path(path) if path else RUNTIME_FILE
+
+
+def _load(path=None):
     try:
-        return json.loads(RUNTIME_FILE.read_text())
+        return json.loads(_path(path).read_text())
     except (FileNotFoundError, ValueError):
         return {}
 
 
-def _save(data):
-    RUNTIME_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1))
-    RUNTIME_FILE.chmod(0o600)
+def _save(data, path=None):
+    f = _path(path)
+    f.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+    f.chmod(0o600)
 
 
 def label_of(w):
     return str(w.get("label", w.get("service_id")))
 
 
-def is_paused():
-    return bool(_load().get("paused"))
+def is_paused(path=None):
+    return bool(_load(path).get("paused"))
 
 
-def set_paused(value):
+def set_paused(value, path=None):
     with _LOCK:
-        data = _load()
+        data = _load(path)
         data["paused"] = bool(value)
-        _save(data)
+        _save(data, path)
 
 
-def block_enabled(w):
-    override = _load().get("blocks", {}).get(label_of(w))
+def block_enabled(w, path=None):
+    override = _load(path).get("blocks", {}).get(label_of(w))
     return bool(w.get("enabled", True)) if override is None else bool(override)
 
 
-def set_block(w, value):
+def set_block(w, value, path=None):
     with _LOCK:
-        data = _load()
+        data = _load(path)
         data.setdefault("blocks", {})[label_of(w)] = bool(value)
-        _save(data)
+        _save(data, path)
 
 
-def reset():
+def reset(path=None):
     with _LOCK:
-        _save({})
+        _save({}, path)
 
 
-def find_blocks(cfg, query):
+def find_blocks(blocks, query):
     """Bloki pasujące do frazy: dokładne dopasowanie etykiety wygrywa, inaczej podciąg (bez polskich znaków)."""
     q = _ascii(query.strip())
     if not q:
         return []
-    blocks = cfg.get("watch", [])
     exact = [w for w in blocks if _ascii(label_of(w)) == q]
     return exact or [w for w in blocks if q in _ascii(label_of(w))]
 
 
-def describe_blocks(cfg):
+def describe_blocks(blocks, path=None):
     lines = []
-    overrides = _load().get("blocks", {})
-    for w in cfg.get("watch", []):
-        mark = "WŁĄCZONY" if block_enabled(w) else "wyłączony"
+    overrides = _load(path).get("blocks", {})
+    for w in blocks:
+        mark = "WŁĄCZONY" if block_enabled(w, path) else "wyłączony"
         note = " (ustawione z Telegrama)" if label_of(w) in overrides else ""
         docs = ", ".join(d.title() for d in w.get("doctors", [])) or "dowolny lekarz"
         lines.append(f"• {label_of(w)}: {mark}{note}\n   {docs}")

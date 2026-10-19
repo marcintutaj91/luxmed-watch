@@ -9,6 +9,7 @@ from unittest import mock
 
 import booking
 import luxmed_watch as lw
+from testutil import make_ctx
 
 TERM = {
     "dateTimeFrom": "2026-10-15T17:20:00", "dateTimeTo": "2026-10-15T18:00:00",
@@ -128,30 +129,34 @@ class ClientPostTests(unittest.TestCase):
 
 
 class CallbackTests(unittest.TestCase):
+    CFG = {"booking": {"enabled": True}}
+
     def setUp(self):
         lw.TG.update({"bot_token": "T", "chat_id": "42"})
-        self.tmp = mock.patch.object(lw, "PENDING_FILE", lw.Path(self._testMethodName + ".pending.json"))
-        self.tmp.start()
-        self.addCleanup(self.tmp.stop)
-        self.addCleanup(lambda: lw.PENDING_FILE.unlink(missing_ok=True))
-        self.book_id = lw.add_pending("k1", TERM, "MONIKA HORVATH SKAPPER", "Stomatolog")
+        self.client = object()
+        self.ctx = make_ctx(self, client=self.client)
+        self.cb_data = lw.add_pending(self.ctx, "k1", TERM, "MONIKA HORVATH SKAPPER", "Stomatolog")
 
     def cb(self, uid=42, data=None):
-        return {"id": "c1", "from": {"id": uid}, "data": data or f"book:{self.book_id}",
+        return {"id": "c1", "from": {"id": uid}, "data": data or self.cb_data,
                 "message": {"chat": {"id": 42}, "message_id": 7}}
+
+    def click(self, **kw):
+        lw.handle_callback([self.ctx], self.CFG, self.cb(**kw))
 
     def test_foreign_user_cannot_book(self):
         with mock.patch.object(lw, "tg_api") as tg, mock.patch.object(booking, "book") as bk:
-            lw.handle_callback(object(), self.cb(uid=999))
+            self.click(uid=999)
         bk.assert_not_called()
         tg.assert_not_called()
-        self.assertIn(self.book_id, lw.load_pending())  # oferta nietknięta
+        self.assertEqual(len(lw.load_pending(self.ctx.files["pending"])), 1)  # oferta nietknięta
 
     def test_click_books_once_and_second_click_is_expired(self):
         with mock.patch.object(lw, "tg_api") as tg, mock.patch.object(booking, "book") as bk:
-            lw.handle_callback(object(), self.cb())
-            lw.handle_callback(object(), self.cb())
+            self.click()
+            self.click()
         self.assertEqual(bk.call_count, 1)
+        self.assertIs(bk.call_args.args[0], self.client)
         texts = [c.kwargs.get("text", "") for c in tg.call_args_list]
         self.assertTrue(any("ZAREZERWOWANO" in t for t in texts))
         self.assertTrue(any("wygasła" in t for t in texts))
@@ -159,13 +164,25 @@ class CallbackTests(unittest.TestCase):
     def test_booking_error_is_reported_not_raised(self):
         with mock.patch.object(lw, "tg_api") as tg, \
                 mock.patch.object(booking, "book", side_effect=booking.BookingError("Termin zajęty")):
-            lw.handle_callback(object(), self.cb())
+            self.click()
         texts = " ".join(c.kwargs.get("text", "") for c in tg.call_args_list)
         self.assertIn("NIE ZAREZERWOWANO", texts)
         self.assertIn("Termin zajęty", texts)
 
+    def test_login_failure_during_booking_is_reported_not_raised(self):
+        with mock.patch.object(lw, "tg_api") as tg, mock.patch.object(booking, "book", side_effect=SystemExit("x")):
+            self.click()
+        self.assertIn("BŁĄD przy rezerwacji", " ".join(c.kwargs.get("text", "") for c in tg.call_args_list))
+
     def test_button_payload_fits_telegram_limit(self):
-        self.assertLessEqual(len(f"book:{self.book_id}".encode()), 64)
+        self.assertLessEqual(len(self.cb_data.encode()), 64)
+        self.assertTrue(self.cb_data.startswith("book:marcin:"))
+
+    def test_legacy_button_without_account_is_still_served(self):
+        legacy = "book:" + self.cb_data.split(":")[2]
+        with mock.patch.object(lw, "tg_api"), mock.patch.object(booking, "book") as bk:
+            self.click(data=legacy)
+        bk.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -15,8 +15,10 @@ config.toml:
     [[watch]]
     account = "zona"    # blok dotyczy tylko tego konta (lista: ["marcin", "zona"]); brak = wszystkie konta
 
-Które konto jest aktywne (od najważniejszego): --account, zmienna LUXMED_ACCOUNT,
+Które konta są aktywne (od najważniejszego): --account, zmienna LUXMED_ACCOUNT,
 komenda /konto z Telegrama (selected_account.json), active_account z configu, jedyne konto.
+Wartość: nazwa konta ("zona"), kilka nazw ("marcin,zona" albo lista w configu) albo "wszystkie" / "all".
+Aktywne konta są obsługiwane jednocześnie, każde z własnymi plikami stanu.
 Stary zapis [auth] nadal działa jako konto "default".
 """
 import json
@@ -57,6 +59,9 @@ def _match(names, wanted):
     raise AccountError(f"Nieznane konto {wanted!r}. Dostępne: {', '.join(names) or 'brak'}")
 
 
+ALL_WORDS = {"all", "wszystkie", "wszystko", "*"}
+
+
 def read_selected():
     try:
         return json.loads(SELECTED_FILE.read_text()).get("account")
@@ -64,13 +69,20 @@ def read_selected():
         return None
 
 
-def set_selected(name):
-    SELECTED_FILE.write_text(json.dumps({"account": name}))
+def set_selected(value):
+    """value: nazwa konta, lista nazw albo "all"."""
+    SELECTED_FILE.write_text(json.dumps({"account": value}))
     SELECTED_FILE.chmod(0o600)
 
 
-def selected_name(cfg, cli=None, environ=None):
-    """Nazwa aktywnego konta według kolejności pierwszeństwa opisanej na górze pliku."""
+def _as_list(value):
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [p for p in str(value).replace(";", ",").split(",") if p.strip()]
+
+
+def selected_names(cfg, cli=None, environ=None):
+    """Lista aktywnych kont (w kolejności z configu), według pierwszeństwa opisanej na górze pliku."""
     environ = os.environ if environ is None else environ
     names = list(list_accounts(cfg))
     if not names:
@@ -78,9 +90,23 @@ def selected_name(cfg, cli=None, environ=None):
     wanted = cli or environ.get("LUXMED_ACCOUNT") or read_selected() or cfg.get("active_account")
     if not wanted:
         if len(names) == 1:
-            return names[0]
-        raise AccountError(f"Jest kilka kont ({', '.join(names)}): ustaw active_account w config.toml.")
-    return _match(names, wanted)
+            return names
+        raise AccountError(f"Jest kilka kont ({', '.join(names)}): ustaw active_account w config.toml "
+                           "(nazwa, lista nazw albo \"wszystkie\").")
+    parts = _as_list(wanted)
+    if any(p.strip().lower() in ALL_WORDS for p in parts):
+        return names
+    chosen = {_match(names, p) for p in parts}
+    return [n for n in names if n in chosen]
+
+
+def selected_name(cfg, cli=None, environ=None):
+    """Jedno aktywne konto (dla poleceń działających na jednym koncie: discover, export, book-test)."""
+    chosen = selected_names(cfg, cli=cli, environ=environ)
+    if len(chosen) > 1:
+        raise AccountError(f"To polecenie działa na jednym koncie, a aktywne są: {', '.join(chosen)}. "
+                           "Podaj --account nazwa.")
+    return chosen[0]
 
 
 def credentials(cfg, name):

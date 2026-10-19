@@ -4,12 +4,11 @@ Uruchom: python -m unittest test_rules -v
 """
 import unittest
 from datetime import date, datetime
-from pathlib import Path
 from unittest import mock
 
-import control
 import luxmed_watch as lw
 import rules
+from testutil import make_ctx
 
 
 def term(dt, doc_id=1, first="MONIKA", last="HORVATH SKAPPER", clinic="LX Stomatologia Warszawa - Modlińska 58"):
@@ -83,50 +82,46 @@ class FakeClient:
 class CheckTests(unittest.TestCase):
     def setUp(self):
         lw.TG.update({"bot_token": "T", "chat_id": "42"})
-        r = mock.patch.object(control, "RUNTIME_FILE", Path(self._testMethodName + ".runtime.json"))
-        r.start()
-        self.addCleanup(r.stop)
-        self.addCleanup(lambda: control.RUNTIME_FILE.unlink(missing_ok=True))
-        p = mock.patch.object(lw, "STATE_FILE", Path(self._testMethodName + ".state.json"))
-        q = mock.patch.object(lw, "PENDING_FILE", Path(self._testMethodName + ".pending.json"))
-        p.start(), q.start()
-        self.addCleanup(p.stop), self.addCleanup(q.stop)
-        for f in (lw.STATE_FILE, lw.PENDING_FILE):
-            self.addCleanup(lambda f=f: f.unlink(missing_ok=True))
 
     def cfg(self, **watch):
         return {"booking": {"enabled": True},
                 "watch": [dict({"label": "Stomatolog", "city_id": 1, "service_id": 6621}, **watch)]}
 
-    def run_check(self, cfg, terms, seen=None):
-        seen = set() if seen is None else seen
+    def run_check(self, cfg, terms, ctx=None):
+        ctx = ctx or make_ctx(self, client=FakeClient({6621: terms}), blocks=cfg["watch"])
+        cfg = dict(cfg, accounts=ctx.cfg["accounts"])
         with mock.patch.object(lw, "notify") as n:
-            lw.check(FakeClient({6621: terms}), cfg, seen)
-        return n, seen
+            lw.check(ctx, cfg)
+        return n, ctx
 
     def test_one_message_per_doctor_with_button_per_term(self):
         terms = [term("2026-10-27T14:40:00"), term("2026-10-26T14:40:00"),
                  term("2026-10-28T15:20:00", doc_id=2, first="ADRIAN", last="SZYMAŃSKI")]
-        n, seen = self.run_check(self.cfg(), terms)
+        n, ctx = self.run_check(self.cfg(), terms)
         self.assertEqual(n.call_count, 2)  # dwóch lekarzy -> dwie wiadomości
         monika = next(c for c in n.call_args_list if "Monika" in c.args[1])
         self.assertEqual(len(monika.args[2]), 2)  # przycisk przy każdym terminie
-        self.assertEqual(len(seen), 3)
+        self.assertEqual(len(ctx.seen), 3)
 
     def test_already_seen_terms_are_not_repeated(self):
         terms = [term("2026-10-26T14:40:00")]
-        _, seen = self.run_check(self.cfg(), terms)
-        n, _ = self.run_check(self.cfg(), terms + [term("2026-10-27T14:40:00")], seen)
+        _, ctx = self.run_check(self.cfg(), terms)
+        ctx.client.by_service[6621] = terms + [term("2026-10-27T14:40:00")]
+        n, _ = self.run_check(self.cfg(), None, ctx=ctx)
         self.assertEqual(n.call_count, 1)
         self.assertIn("1 nowy termin", n.call_args.args[1])
 
+    def test_state_is_written_to_the_accounts_own_file(self):
+        _, ctx = self.run_check(self.cfg(), [term("2026-10-26T14:40:00")])
+        self.assertEqual(len(lw.load_state(ctx.files["state"])), 1)
+
     def test_hour_filter_drops_terms_and_does_not_mark_them_seen(self):
         terms = [term("2026-10-26T09:00:00"), term("2026-10-26T17:20:00")]
-        n, seen = self.run_check(self.cfg(hours_from="16:00"), terms)
+        n, ctx = self.run_check(self.cfg(hours_from="16:00"), terms)
         self.assertEqual(n.call_count, 1)
         self.assertIn("17:20", n.call_args.args[1])
         self.assertNotIn("09:00", n.call_args.args[1])
-        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(ctx.seen), 1)
 
     def test_term_matching_two_blocks_is_reported_once_by_the_first(self):
         terms = [term("2026-10-26T14:40:00", doc_id=2, first="ADRIAN", last="SZYMAŃSKI"),
@@ -134,7 +129,7 @@ class CheckTests(unittest.TestCase):
         specific = {"label": "Szymański", "city_id": 1, "service_id": 6621, "doctors": ["SZYMAŃSKI"]}
         general = {"label": "Dowolny", "city_id": 1, "service_id": 6621}
         cfg = {"booking": {"enabled": True}, "watch": [specific, general]}
-        n, seen = self.run_check(cfg, terms)
+        n, _ = self.run_check(cfg, terms)
         self.assertEqual(n.call_count, 2)
         by_label = {c.args[0]: c.args[1] for c in n.call_args_list}
         self.assertIn("Szymański", by_label["Lux Med: Szymański"])
@@ -143,9 +138,9 @@ class CheckTests(unittest.TestCase):
 
     def test_disabled_block_is_skipped_and_enabled_by_default(self):
         terms = [term("2026-10-26T14:40:00")]
-        n, seen = self.run_check(self.cfg(enabled=False), terms)
+        n, ctx = self.run_check(self.cfg(enabled=False), terms)
         n.assert_not_called()
-        self.assertEqual(seen, set())
+        self.assertEqual(ctx.seen, set())
         n, _ = self.run_check(self.cfg(enabled=True), terms)
         self.assertEqual(n.call_count, 1)
 
@@ -165,10 +160,10 @@ class CheckTests(unittest.TestCase):
 
     def test_cap_per_message_leaves_rest_for_next_round(self):
         terms = [term(f"2026-10-{d:02d}T10:00:00") for d in range(10, 25)]  # 15 terminów
-        n, seen = self.run_check(self.cfg(), terms)
+        n, ctx = self.run_check(self.cfg(), terms)
         self.assertEqual(len(n.call_args.args[2]), lw.MAX_PER_MESSAGE)
-        self.assertEqual(len(seen), lw.MAX_PER_MESSAGE)
-        n2, _ = self.run_check(self.cfg(), terms, seen)
+        self.assertEqual(len(ctx.seen), lw.MAX_PER_MESSAGE)
+        n2, _ = self.run_check(self.cfg(), None, ctx=ctx)
         self.assertEqual(n2.call_count, 1)  # reszta w następnej rundzie
 
 

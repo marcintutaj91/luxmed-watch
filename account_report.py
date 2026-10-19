@@ -182,7 +182,10 @@ def _credentials(config_path, account=None):
         accounts = cfg.get("accounts")
         if accounts:  # format z kilkoma kontami: [accounts.nazwa]
             names = list(accounts)
-            wanted = account or cfg.get("active_account") or (names[0] if len(names) == 1 else None)
+            wanted = account or cfg.get("active_account")
+            if isinstance(wanted, list) or str(wanted or "").lower() in ("all", "wszystkie", "*") or "," in str(wanted or ""):
+                wanted = None  # raport robi się dla jednego konta naraz
+            wanted = wanted or (names[0] if len(names) == 1 else None)
             match = next((n for n in names if wanted and n.lower() == str(wanted).lower()), None)
             if not match:
                 raise SystemExit(f"Podaj --account. Dostępne konta: {', '.join(names)}")

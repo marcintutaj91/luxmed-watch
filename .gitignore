@@ -6,3 +6,4 @@ __pycache__/
 catalog.json
 pending.json
 runtime.json
+report-*.json

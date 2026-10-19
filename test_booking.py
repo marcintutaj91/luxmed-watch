@@ -57,6 +57,13 @@ class BookTests(unittest.TestCase):
         self.assertEqual(confirm["valuation"], VAL)
         self.assertEqual(confirm["timeFrom"], "17:20")
 
+    def test_dry_run_exposes_prices_so_paid_visits_can_be_inspected(self):
+        c = FakeClient(lock_ok())
+        out = booking.book(c, TERM, dry_run=True)
+        self.assertEqual(out["valuations"][0]["price"], 0.0)
+        self.assertEqual(out["valuations"][0]["payerId"], 760)
+        self.assertNotIn("contractId", out["valuations"][0])  # tylko podstawowe pola
+
     def test_lock_body_fields(self):
         b = booking.lock_body(TERM)
         self.assertEqual((b["doctorId"], b["facilityId"], b["roomId"], b["scheduleId"], b["serviceVariantId"]),

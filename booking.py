@@ -78,6 +78,12 @@ def _release(client, temporary_id):
         print("Nie udało się zwolnić blokady:", type(e).__name__, e)
 
 
+def summarize(valuations):
+    """Skrót wycen z portalu (cena, płatnik, typ, wymagane skierowanie) do podglądu w book-test."""
+    keys = ("price", "alternativePrice", "payerId", "valuationType", "isReferralRequired", "requireReferralForPP")
+    return [{k: v.get(k) for k in keys} for v in valuations]
+
+
 def book(client, t, dry_run=False):
     """Zarezerwuj termin t (słownik z terms/index). Zwraca odpowiedź portalu.
 
@@ -113,7 +119,7 @@ def book(client, t, dry_run=False):
 
         if dry_run:
             _release(client, temp_id)
-            return {"dry_run": True, "temporaryReservationId": temp_id}
+            return {"dry_run": True, "temporaryReservationId": temp_id, "valuations": summarize(valuations)}
 
         resp = client.post("/NewPortal/reservation/confirm", confirm_body(t, temp_id, valuations[0]))
         if resp.get("hasErrors"):

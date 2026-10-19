@@ -176,12 +176,22 @@ def compare_reports(a, b):
 
 # ---------------------------------------------------------------- CLI
 
-def _credentials(config_path):
+def _credentials(config_path, account=None):
     if config_path:
-        auth = tomllib.loads(Path(config_path).read_text()).get("auth", {})
+        cfg = tomllib.loads(Path(config_path).read_text())
+        accounts = cfg.get("accounts")
+        if accounts:  # format z kilkoma kontami: [accounts.nazwa]
+            names = list(accounts)
+            wanted = account or cfg.get("active_account") or (names[0] if len(names) == 1 else None)
+            match = next((n for n in names if wanted and n.lower() == str(wanted).lower()), None)
+            if not match:
+                raise SystemExit(f"Podaj --account. Dostępne konta: {', '.join(names)}")
+            auth = accounts[match]
+        else:
+            auth = cfg.get("auth", {})
         if auth.get("login") and auth.get("password"):
             return auth["login"], auth["password"]
-        raise SystemExit(f"Brak login/password w sekcji [auth] pliku {config_path}.")
+        raise SystemExit(f"Brak login/password dla wybranego konta w pliku {config_path}.")
     login = os.getenv("LUXMED_LOGIN") or input("Login do Portalu Pacjenta: ").strip()
     password = os.getenv("LUXMED_PASSWORD") or getpass.getpass("Hasło (nie będzie widoczne): ")
     return login, password
@@ -196,7 +206,8 @@ def main():
     r.add_argument("--services", default="6621,4448",
                    help="ID usług po przecinku (domyślnie 6621 Stomatolog, 4448 Konsultacja dermatologiczna)")
     r.add_argument("--days", type=int, default=60)
-    r.add_argument("--config", help="opcjonalnie: config.toml z sekcją [auth] zamiast pytania w terminalu")
+    r.add_argument("--config", help="opcjonalnie: config.toml ([auth] lub [accounts.*]) zamiast pytania w terminalu")
+    r.add_argument("--account", help="konto z [accounts.*] w configu (domyślnie active_account)")
     c = sub.add_parser("compare", help="porównaj dwa raporty")
     c.add_argument("a")
     c.add_argument("b")
@@ -207,7 +218,7 @@ def main():
         print("\n".join(compare_reports(*reports)))
         return
 
-    login, password = _credentials(args.config)
+    login, password = _credentials(args.config, args.account)
     services = [int(x) for x in args.services.split(",") if x.strip()]
     print("Pobieram dane (tylko odczyt, kilkanaście zapytań z przerwami)…")
     report = build_report(Client(login, password), args.name, args.city, services, args.days)

@@ -19,6 +19,7 @@ HELP = """Komendy:
 /wylacz <nazwa> - wyłącz blok
 /pauza - wstrzymaj powiadomienia
 /wznow - wznów powiadomienia
+/konto - pokaż lub przełącz konto (np. /konto zona)
 /reset - wróć do ustawień z config.toml"""
 
 COMMANDS = [  # do menu Telegrama (tylko małe litery łacińskie, cyfry i _)
@@ -29,6 +30,7 @@ COMMANDS = [  # do menu Telegrama (tylko małe litery łacińskie, cyfry i _)
     ("wylacz", "Wyłącz blok: /wylacz nazwa"),
     ("pauza", "Wstrzymaj powiadomienia"),
     ("wznow", "Wznów powiadomienia"),
+    ("konto", "Pokaż lub przełącz konto"),
     ("reset", "Wróć do ustawień z configu"),
     ("pomoc", "Lista komend"),
 ]

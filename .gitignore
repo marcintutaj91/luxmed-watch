@@ -7,3 +7,7 @@ catalog.json
 pending.json
 runtime.json
 report-*.json
+state*.json
+pending*.json
+runtime*.json
+selected_account.json

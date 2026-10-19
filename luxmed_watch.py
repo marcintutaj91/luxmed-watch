@@ -28,6 +28,7 @@ from pathlib import Path
 
 import requests
 
+import accounts
 import booking
 import control
 import rules
@@ -38,6 +39,7 @@ STATE_FILE = Path(__file__).with_name("state.json")
 PENDING_FILE = Path(__file__).with_name("pending.json")
 PENDING_LOCK = threading.Lock()
 PENDING_TTL = 24 * 3600
+ACCOUNT = {"name": "default", "multi": False, "booking": True}  # ustawiane w main()
 STATUS = {"last_ok": None, "fails": 0, "last_error": None}
 WAKE = threading.Event()  # przerywa oczekiwanie między sprawdzeniami (np. po /wlacz)
 COMMAND_MAX_AGE = 120  # ignoruj komendy starsze niż tyle sekund (np. zaległe po restarcie)
@@ -149,8 +151,14 @@ def flatten(node, acc=None):
     return acc
 
 
+def acct_tag():
+    """'[zona] ' gdy skonfigurowano kilka kont, żeby było wiadomo, czyje to powiadomienie."""
+    return f"[{ACCOUNT['name']}] " if ACCOUNT["multi"] else ""
+
+
 def notify(title, msg, buttons=None):
     """buttons: lista (tekst, book_id); każdy przycisk w osobnym wierszu."""
+    title = acct_tag() + title
     print(f"\n*** {title}\n{msg}\n")
     try:  # powiadomienie macOS
         subprocess.run(["osascript",
@@ -217,7 +225,7 @@ def handle_callback(client, cb):
         entry = pending.pop(data[5:], None)
         save_pending(pending)
     if not entry:
-        tg_api("answerCallbackQuery", callback_query_id=cb["id"], text="Ta oferta wygasła lub już obsłużona.")
+        tg_api("answerCallbackQuery", callback_query_id=cb["id"], text="Oferta wygasła, była już obsłużona albo dotyczy innego konta.")
         return
     tg_api("answerCallbackQuery", callback_query_id=cb["id"], text="Rezerwuję…")
     summary = format_term(entry["term"], entry["name"])
@@ -230,7 +238,7 @@ def handle_callback(client, cb):
         result = f"BŁĄD przy rezerwacji ({type(e).__name__}); sprawdź portal.\n{summary}"
     print("\n***", result, "\n")
     if chat and mid:  # zdejmij przycisk i pokaż wynik w tej samej wiadomości
-        tg_api("editMessageText", chat_id=chat, message_id=mid, text=f"Lux Med: {entry['label']}\n{result}")
+        tg_api("editMessageText", chat_id=chat, message_id=mid, text=f"{acct_tag()}Lux Med: {entry['label']}\n{result}")
     else:
         tg_api("sendMessage", chat_id=TG["chat_id"], text=result)
 
@@ -336,7 +344,8 @@ MAX_PER_MESSAGE = 10  # reszta trafi do kolejnej wiadomości w następnej rundzi
 
 
 def can_book_now(cfg):
-    return bool(cfg.get("booking", {}).get("enabled")) and bool(TG.get("bot_token") and TG.get("chat_id"))
+    return (bool(cfg.get("booking", {}).get("enabled")) and ACCOUNT["booking"]
+            and bool(TG.get("bot_token") and TG.get("chat_id")))
 
 
 def collect_groups(client, cfg, seen):
@@ -375,7 +384,7 @@ def reply(text):
 
 
 def status_text(cfg):
-    lines = ["Nasłuch działa."]
+    lines = [f"Nasłuch działa. Konto: {ACCOUNT['name']}"]
     if STATUS["last_ok"]:
         ago = int((time.time() - STATUS["last_ok"]) // 60)
         lines.append(f"Ostatnie udane sprawdzenie: {datetime.fromtimestamp(STATUS['last_ok']):%H:%M:%S} ({ago} min temu)")
@@ -405,6 +414,28 @@ def toggle_block(cfg, arg, value):
     return f"{control.label_of(found[0])}: {state}"
 
 
+def switch_account(cfg, arg):
+    names = list(accounts.list_accounts(cfg))
+    current = f"Aktywne konto: {ACCOUNT['name']}. Dostępne: {', '.join(names)}."
+    if not arg:
+        return current + ("\nPrzełączenie: /konto <nazwa>" if len(names) > 1 else "")
+    try:
+        target = accounts._match(names, arg)
+    except accounts.AccountError as e:
+        return str(e)
+    if target == ACCOUNT["name"]:
+        return f"Konto {target} jest już aktywne."
+    try:
+        accounts.credentials(cfg, target)
+        accounts.blocks_for(cfg, target)
+    except accounts.AccountError as e:
+        return f"Nie przełączam: {e}"
+    accounts.set_selected(target)
+    threading.Timer(1.5, os._exit, args=(0,)).start()  # launchd uruchomi nasłuch ponownie (ok. 30 s)
+    return (f"Przełączam na konto {target}. Nasłuch uruchomi się ponownie (ok. 30 s). "
+            "Jeśli nie działa jako usługa, uruchom go ręcznie.")
+
+
 def handle_message(client, cfg, msg):
     """Komendy z Telegrama; tylko od właściciela bota."""
     if str(msg.get("from", {}).get("id")) != str(TG.get("chat_id")):
@@ -421,6 +452,8 @@ def handle_message(client, cfg, msg):
         reply(status_text(cfg))
     elif cmd == "bloki":
         reply(control.describe_blocks(cfg))
+    elif cmd == "konto":
+        reply(switch_account(cfg, arg))
     elif cmd in ("wlacz", "wylacz"):
         reply(toggle_block(cfg, arg, cmd == "wlacz"))
     elif cmd == "pauza":
@@ -455,6 +488,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--config", default=str(Path(__file__).with_name("config.toml")))
+    ap.add_argument("--account", help="konto z [accounts.*] (domyślnie: active_account z configu)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("discover")
     d.add_argument("what", choices=["cities", "services", "doctors"])
@@ -485,11 +519,21 @@ def main():
     if a.cmd == "telegram":
         telegram_setup()
         return
-    login = auth.get("login") or os.getenv("LUXMED_LOGIN")
-    pw = auth.get("password") or os.getenv("LUXMED_PASSWORD")
-    if not login or not pw:
-        raise SystemExit("Brak danych logowania: uzupełnij sekcję [auth] w config.toml "
-                         "(albo ustaw LUXMED_LOGIN i LUXMED_PASSWORD).")
+    try:
+        if not accounts.list_accounts(cfg) and os.getenv("LUXMED_LOGIN") and os.getenv("LUXMED_PASSWORD"):
+            cfg["auth"] = {"login": os.getenv("LUXMED_LOGIN"), "password": os.getenv("LUXMED_PASSWORD")}
+        name = accounts.selected_name(cfg, cli=a.account)
+        login, pw = accounts.credentials(cfg, name)
+        cfg["watch"] = accounts.blocks_for(cfg, name)
+        files = accounts.paths(name)
+    except accounts.AccountError as ex:
+        raise SystemExit(f"Konta: {ex}")
+    global STATE_FILE, PENDING_FILE
+    STATE_FILE, PENDING_FILE, control.RUNTIME_FILE = files["state"], files["pending"], files["runtime"]
+    ACCOUNT.update(name=name, multi=len(accounts.list_accounts(cfg)) > 1,
+                   booking=accounts.booking_allowed(cfg, name))
+    if ACCOUNT["multi"]:
+        print(f"Aktywne konto: {name}")
     client = Luxmed(login, pw)
 
     if a.cmd == "discover":
@@ -532,8 +576,9 @@ def main():
               f"{sum(len(v) for v in doctors.values())} pozycji lekarzy.")
         return
 
-    if "watch" not in cfg:
-        raise SystemExit("Brak bloków [[watch]] w config.toml.")
+    if not cfg.get("watch"):
+        raise SystemExit(f"Brak bloków [[watch]] w config.toml dla konta {ACCOUNT['name']} "
+                         "(dodaj blok, np. z account = \"nazwa\").")
 
     try:
         for w_ in cfg["watch"]:

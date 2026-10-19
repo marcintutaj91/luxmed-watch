@@ -24,6 +24,8 @@ Stary zapis [auth] nadal działa jako konto "default".
 import json
 import os
 import re
+import tempfile
+import tomllib
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -153,3 +155,52 @@ def paths(name):
         "pending": HERE / f"pending{suffix}.json",
         "runtime": HERE / f"runtime{suffix}.json",
     }
+
+
+def _toml_str(value):
+    """Zapis tekstu w TOML: apostrofy (tekst dosłowny), a przy apostrofie w treści cudzysłów z escapowaniem."""
+    if "'" not in value and "\n" not in value and "\r" not in value:
+        return f"'{value}'"
+    return json.dumps(value)  # poprawny TOML basic string
+
+
+def set_credentials(config_path, name, login, password):
+    """Wpisuje login i hasło do [accounts.<name>] w config.toml (tworzy sekcję, gdy jej nie ma).
+
+    Reszta pliku zostaje bez zmian. Wynik jest sprawdzany parserem TOML przed zapisem.
+    """
+    if not _NAME_RE.match(name):
+        raise AccountError(f"Niedozwolona nazwa konta: {name!r} (litery bez polskich znaków, cyfry, _ i -)")
+    if not login or not password:
+        raise AccountError("Login i hasło nie mogą być puste.")
+    path = Path(config_path)
+    lines = path.read_text().split("\n") if path.exists() else []
+    header = f"[accounts.{name}]"
+    new = {"login": f"login = {_toml_str(login)}", "password": f"password = {_toml_str(password)}"}
+    start = next((i for i, l in enumerate(lines) if l.strip() == header), None)
+    if start is None:
+        block = [header, new["login"], new["password"], ""]
+        anchor = next((i for i, l in enumerate(lines) if l.strip() in ("[telegram]", "[booking]", "[[watch]]")),
+                      len(lines))
+        lines[anchor:anchor] = block
+    else:
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+        for key in ("login", "password"):
+            idx = next((i for i in range(start + 1, end) if re.match(rf"\s*{key}\s*=", lines[i])), None)
+            if idx is None:
+                lines.insert(start + 1, new[key])
+                end += 1
+            else:
+                lines[idx] = new[key]
+    text = "\n".join(lines)
+    try:
+        parsed = tomllib.loads(text)
+        got = parsed["accounts"][name]
+        assert got["login"] == login and got["password"] == password
+    except (tomllib.TOMLDecodeError, KeyError, AssertionError):
+        raise AccountError("Nie udało się bezpiecznie zapisać danych (wynik nie przeszedł kontroli). Config bez zmian.") from None
+    fd, tmp = tempfile.mkstemp(dir=path.parent if path.exists() else ".", prefix=".config-")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)

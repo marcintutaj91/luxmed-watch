@@ -598,6 +598,8 @@ def main():
     e.add_argument("--filter", action="append", required=True,
                    help="fragment nazwy usługi, można podać wielokrotnie, np. --filter stomat --filter dermat")
     sub.add_parser("telegram", help="znajdź chat_id i wyślij wiadomość testową")
+    ad = sub.add_parser("add-account", help="wpisz login i hasło konta do config.toml (pyta w terminalu)")
+    ad.add_argument("name", help="nazwa konta w [accounts.<nazwa>], np. prywatna")
     sub.add_parser("book-test", help="test rezerwacji bez potwierdzenia: zablokuj pierwszy pasujący termin i zwolnij")
     w = sub.add_parser("watch")
     w.add_argument("--once", action="store_true")
@@ -605,6 +607,18 @@ def main():
     DEBUG = a.debug
 
     cfg_path = Path(a.config)
+    if a.cmd == "add-account":
+        import getpass
+        login = input(f"Login do konta '{a.name}': ").strip()
+        password = getpass.getpass("Hasło (nie będzie widoczne): ")
+        if password != getpass.getpass("Powtórz hasło: "):
+            raise SystemExit("Hasła się różnią. Nic nie zapisano.")
+        try:
+            accounts.set_credentials(cfg_path, a.name, login, password)
+        except accounts.AccountError as ex:
+            raise SystemExit(f"Konta: {ex}")
+        print(f"Zapisano dane konta '{a.name}' w {cfg_path.name}. Dodaj je do active_account i uruchom ./service.sh install.")
+        return
     try:
         cfg = tomllib.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     except tomllib.TOMLDecodeError as ex:

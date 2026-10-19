@@ -121,6 +121,83 @@ class CredentialsAndBlocksTests(Tmp):
             self.assertNotEqual(a[key], b[key])
 
 
+SAMPLE = """interval_minutes = 5
+active_account = ["marcin"]
+
+[accounts.marcin]
+login = 'm'
+password = 'p1'
+
+[accounts.prywatna]
+login = ''
+password = ''
+booking = false   # komentarz zostaje
+
+[telegram]
+bot_token = 'TOKEN'
+
+[[watch]]
+account = "prywatna"
+label = "Derm"
+"""
+
+
+class SetCredentialsTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = Path(self.dir.name) / "config.toml"
+        self.path.write_text(SAMPLE)
+
+    def load(self):
+        import tomllib
+        return tomllib.loads(self.path.read_text())
+
+    def test_fills_empty_section_and_leaves_everything_else_untouched(self):
+        accounts.set_credentials(self.path, "prywatna", "jan", "tajne123")
+        cfg = self.load()
+        self.assertEqual(cfg["accounts"]["prywatna"], {"login": "jan", "password": "tajne123", "booking": False})
+        self.assertEqual(cfg["accounts"]["marcin"], {"login": "m", "password": "p1"})
+        self.assertEqual(cfg["telegram"]["bot_token"], "TOKEN")
+        self.assertIn("# komentarz zostaje", self.path.read_text())
+        expected = SAMPLE.replace("login = ''", "login = 'jan'").replace("password = ''", "password = 'tajne123'")
+        self.assertEqual(self.path.read_text(), expected)
+
+    def test_special_characters_roundtrip(self):
+        for pw in ("a'b", 'a"b\\c', "zażółć gęślą", "tab\there", "#nie komentarz", "mix'\"\\"):
+            with self.subTest(pw=pw):
+                accounts.set_credentials(self.path, "prywatna", "l'og", pw)
+                got = self.load()["accounts"]["prywatna"]
+                self.assertEqual((got["login"], got["password"]), ("l'og", pw))
+
+    def test_creates_missing_section_before_telegram(self):
+        accounts.set_credentials(self.path, "nowa", "n", "pw")
+        cfg = self.load()
+        self.assertEqual(cfg["accounts"]["nowa"], {"login": "n", "password": "pw"})
+        self.assertEqual(cfg["watch"][0]["label"], "Derm")
+        self.assertLess(self.path.read_text().index("[accounts.nowa]"), self.path.read_text().index("[telegram]"))
+
+    def test_adds_missing_keys_to_existing_section(self):
+        self.path.write_text("[accounts.x]\nbooking = false\n")
+        accounts.set_credentials(self.path, "x", "l", "p")
+        self.assertEqual(self.load()["accounts"]["x"], {"login": "l", "password": "p", "booking": False})
+
+    def test_file_is_private_and_bad_input_changes_nothing(self):
+        accounts.set_credentials(self.path, "prywatna", "l", "p")
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        before = self.path.read_text()
+        for name, login, pw in (("../x", "l", "p"), ("prywatna", "", "p"), ("prywatna", "l", "")):
+            with self.assertRaises(accounts.AccountError):
+                accounts.set_credentials(self.path, name, login, pw)
+        self.assertEqual(self.path.read_text(), before)
+
+    def test_new_account_then_is_usable_by_selection(self):
+        accounts.set_credentials(self.path, "prywatna", "jan", "pw")
+        cfg = self.load()
+        self.assertEqual(accounts.credentials(cfg, "prywatna"), ("jan", "pw"))
+
+
 def msg(text):
     return {"from": {"id": 42}, "text": text, "date": time.time()}
 

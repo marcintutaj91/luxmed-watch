@@ -66,6 +66,19 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(len(buttons), 2)
         self.assertTrue(buttons[0].startswith("Zarezerwuj czw 15.10, 17:20"))
 
+    def test_group_without_a_doctor_has_no_name_prefix(self):
+        body, _ = rules.format_group("", [term("2026-10-15T17:20:00")], today=date(2026, 10, 15))
+        self.assertEqual(body.split("\n")[0], "1 nowy termin")
+        self.assertNotIn("None", body)
+
+    def test_clinic_notes_and_links_are_dropped(self):
+        self.assertEqual(rules.clean_clinic("LX Warszawa - 1 sierpnia 8 Parking przy placówce Lux Med. 1 Sierpnia 8 będzie odpłatny"),
+                         "LX Warszawa - 1 sierpnia 8")
+        self.assertEqual(rules.short_clinic("LX Warszawa - Sierakowskiego 3 (informacje o dojezdzie https://bit.ly/x)"),
+                         "Sierakowskiego 3")
+        self.assertEqual(rules.short_clinic("LX Stomatologia Warszawa - Modlińska 58"), "Modlińska 58")
+        self.assertEqual(rules.short_clinic(None), "")
+
     def test_button_fits_telegram_callback_limit(self):
         _, buttons = rules.format_group("A B", [term("2026-10-15T17:20:00")], today=date(2026, 10, 15))
         self.assertLess(len(buttons[0]), 64)
@@ -135,6 +148,13 @@ class CheckTests(unittest.TestCase):
         self.assertIn("Szymański", by_label["Lux Med: Szymański"])
         self.assertNotIn("Szymański", by_label["Lux Med: Dowolny"])
         self.assertIn("Anna Nowak", by_label["Lux Med: Dowolny"])
+
+    def test_term_with_null_doctor_names_is_reported_without_none(self):
+        terms = [term("2026-10-27T14:40:00", doc_id=0, first=None, last=None)]
+        n, _ = self.run_check(self.cfg(), terms)
+        self.assertEqual(n.call_count, 1)
+        self.assertNotIn("None", n.call_args.args[1])
+        self.assertTrue(n.call_args.args[1].startswith("1 nowy termin"))
 
     def test_disabled_block_is_skipped_and_enabled_by_default(self):
         terms = [term("2026-10-26T14:40:00")]

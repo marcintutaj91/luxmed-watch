@@ -1,4 +1,5 @@
 """Filtry godzin i dni oraz formatowanie zgrupowanych powiadomień (czysta logika, bez sieci)."""
+import re
 from datetime import date, datetime
 
 DNI = ["pon", "wt", "śr", "czw", "pt", "sob", "ndz"]
@@ -68,9 +69,15 @@ def _plural(n):
     return "nowych terminów"
 
 
+def clean_clinic(clinic):
+    """Usuwa z nazwy placówki dopiski (linki dojazdu w nawiasach, uwagi o parkingu)."""
+    c = re.sub(r"\s*\([^)]*https?://[^)]*\)", "", clinic or "")
+    return re.split(r"\s+[Pp]arking\b", c)[0].strip()
+
+
 def short_clinic(clinic):
     """'LX Stomatologia Warszawa - Modlińska 58' -> 'Modlińska 58'."""
-    return (clinic or "").split(" - ")[-1].strip()
+    return clean_clinic(clinic).split(" - ")[-1].strip()
 
 
 def _when(t, today):
@@ -85,7 +92,8 @@ def format_group(name, terms, today=None):
     """Treść wiadomości dla jednego lekarza i etykiety przycisków (po jednym na termin)."""
     today = today or date.today()
     terms = sorted(terms, key=lambda t: t["dateTimeFrom"])
-    lines, buttons = [f"{name.title()}: {len(terms)} {_plural(len(terms))}"], []
+    count = f"{len(terms)} {_plural(len(terms))}"
+    lines, buttons = [f"{name.title()}: {count}" if name.strip() else count[0].upper() + count[1:]], []
     for t in terms:
         s, rel = _when(t, today)
         place = short_clinic(t.get("clinic"))

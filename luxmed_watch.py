@@ -365,7 +365,7 @@ def format_term(t, name):
     rel = {0: "DZIŚ", 1: "jutro"}.get(days, f"za {days} dni" if days > 1 else "")
     if rel:
         when += f" · {rel}"
-    lines = [when, name.title(), t.get("clinic", "")]
+    lines = [when, name.title(), rules.clean_clinic(t.get("clinic", ""))]
     if t.get("isTelemedicine"):
         lines.append("TELEPORADA")
     return "\n".join(x for x in lines if x)
@@ -385,7 +385,7 @@ def find_terms(ctx, cfg):
         terms = ctx.client.terms(w["city_id"], w.get("city_name", ""), w["service_id"], d_from, d_to)
         for t in terms:
             doc = t.get("doctor") or {}
-            name = f"{doc.get('firstName', '')} {doc.get('lastName', '')}".strip()
+            name = " ".join(x for x in (doc.get("firstName"), doc.get("lastName")) if x)  # usługi bez lekarza: null
             if doctors and not any(x in name.lower() for x in doctors):
                 continue
             if clinics and str(t.get("clinicGroupId", t.get("clinicId"))) not in clinics:
